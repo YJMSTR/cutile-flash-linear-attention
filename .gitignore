@@ -40,6 +40,13 @@ __pycache__
 
 # vscode
 .vscode
+# cursor
+.cursor
 
 # macOS
 .DS_Store
+
+# environments
+.venv/
+venv/
+cutile-fla/

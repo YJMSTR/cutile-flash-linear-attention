@@ -6,7 +6,7 @@
 
 </div>
 
-This repo aims at providing a collection of efficient Triton-based implementations for state-of-the-art linear attention models. **All implementations are written purely in PyTorch and Triton, making them platform-agnostic.** Currently verified platforms include NVIDIA, AMD, and Intel. **Any pull requests are welcome!**
+This project is developed based on [fla-org/flash-linear-attention](https://github.com/fla-org/flash-linear-attention), dedicated to providing high-performance linear attention implementations on the **NVIDIA Blackwell** platform using the emerging **[cuTile](https://github.com/NVIDIA/cutile-python)** DSL. **Any pull requests are welcome!**
 
 <div align="center">
   <img width="400" alt="image" src="https://github.com/fla-org/flash-linear-attention/assets/18402347/02ff2e26-1495-4088-b701-e72cd65ac6cf">

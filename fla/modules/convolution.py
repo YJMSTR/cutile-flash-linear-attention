@@ -4,12 +4,14 @@ import math
 import warnings
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 import triton
 import triton.language as tl
 from einops import rearrange
 
+from fla.ops.cp import FLACPContext, conv_cp_send_recv_bwd, conv_cp_send_recv_fwd
 from fla.ops.utils import prepare_chunk_indices, prepare_sequence_ids
 from fla.utils import IS_AMD, autotune_cache_kwargs, get_multiprocessor_count, input_guard
 
@@ -147,7 +149,7 @@ def causal_conv1d_fwd_kernel(
 @triton.heuristics({
     'HAS_WEIGHT': lambda args: args['dw'] is not None,
     'HAS_BIAS': lambda args: args['db'] is not None,
-    'USE_INITIAL_STATE': lambda args: args['dh0'] is not None,
+    'USE_INITIAL_STATE': lambda args: args['initial_state'] is not None,
     'USE_FINAL_STATE': lambda args: args['dht'] is not None,
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
@@ -166,7 +168,6 @@ def causal_conv1d_bwd_kernel(
     y,
     weight,
     initial_state,
-    dh0,
     dht,
     dy,
     dx,
@@ -223,7 +224,7 @@ def causal_conv1d_bwd_kernel(
     if HAS_BIAS:
         b_db = tl.zeros((BD,), dtype=tl.float32)
 
-    if not USE_FINAL_STATE:
+    if not USE_FINAL_STATE and not USE_INITIAL_STATE:
         for i_w in tl.static_range(0, W):
             p_dy = tl.make_block_ptr(dy + bos * D, (T, D), (D, 1), (i_t * BT + i_w, i_d * BD), (BT, BD), (1, 0))
             # [BT, BD]
@@ -303,33 +304,6 @@ def causal_conv1d_bwd_kernel(
                 b_db += tl.sum(b_dy_shift, 0)
             b_wdy = b_dy_shift if not HAS_WEIGHT else (b_dy_shift * tl.sum(b_w * (o_w == (W - i_w - 1)), 1))
             b_dx += b_wdy
-
-        if USE_INITIAL_STATE:
-            p_dy0 = tl.make_block_ptr(dy + bos * D, (T, D), (D, 1), (i_t * BT, i_d * BD), (BT, BD), (1, 0))
-            b_dy0 = tl.load(p_dy0, boundary_check=(0, 1)).to(tl.float32)
-            if ACTIVATION == 'swish' or ACTIVATION == 'silu':
-                p_y0 = tl.make_block_ptr(y + bos * D, (T, D), (D, 1), (i_t * BT, i_d * BD), (BT, BD), (1, 0))
-                b_y0 = tl.load(p_y0, boundary_check=(0, 1)).to(tl.float32)
-                b_ys0 = tl.sigmoid(b_y0)
-                b_dy0 = b_dy0 * b_ys0 * (1 + b_y0 * (1 - b_ys0))
-            # index 0 is padding 0, skip calculation
-            for i_w in tl.static_range(1, W):
-                m_rows = (o_t < i_w)
-                if HAS_WEIGHT:
-                    # [BT]
-                    w_idx_rows = i_w - 1 - o_t
-                    # [BT, BW]
-                    w_mask = (o_w[None, :] == w_idx_rows[:, None])
-                    w_pick = tl.sum(b_w[None, :, :] * w_mask[:, None, :], 2)
-                else:
-                    w_pick = 1.0
-                contrib = (b_dy0 * w_pick).to(tl.float32)
-                contrib = tl.where(m_rows[:, None] & m_d[None, :], contrib, 0.0)
-                # [BD]
-                b_dh0_s = tl.sum(contrib, 0)
-                # dh0: [NT, B, D, W]
-                tl.store(dh0 + i_t * B * D * W + i_n * D * W + o_d * W + i_w,
-                         b_dh0_s.to(dh0.dtype.element_ty, fp_downcast_rounding='rtne'), mask=m_d)
 
     if HAS_BIAS:
         b_db = tl.cast(b_db, dtype=db.dtype.element_ty, fp_downcast_rounding='rtne')
@@ -504,6 +478,127 @@ def causal_conv1d_fwd(
     return y.view(shape), final_state
 
 
+@triton.heuristics({
+    'USE_ACTIVATION': lambda args: args['y'] is not None,
+    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
+})
+@triton.jit
+def compute_dh0_kernel(
+    dy,
+    y,
+    weight,
+    dh0,
+    cu_seqlens,
+    stride_dy_n,
+    stride_dy_t,
+    T,
+    D: tl.constexpr,
+    W: tl.constexpr,
+    BD: tl.constexpr,
+    USE_ACTIVATION: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
+):
+    """
+    Compute dh0 (gradient w.r.t. initial_state) in a separate kernel.
+    This avoids Triton compiler bugs on some architectures (e.g., GB200).
+
+    Grid: (cdiv(D, BD), N)
+    """
+    i_d, i_n = tl.program_id(0), tl.program_id(1)
+
+    # Get sequence boundaries
+    if IS_VARLEN:
+        bos = tl.load(cu_seqlens + i_n).to(tl.int32)
+        eos = tl.load(cu_seqlens + i_n + 1).to(tl.int32)
+        seq_len = eos - bos
+        # For varlen, dy is [1, total_T, D], offset by bos
+        dy_base = dy + bos * stride_dy_t
+    else:
+        seq_len = T
+        # For non-varlen, dy is [B, T, D], offset by i_n * stride_dy_n
+        dy_base = dy + i_n * stride_dy_n
+
+    o_d = i_d * BD + tl.arange(0, BD)
+    m_d = o_d < D
+
+    # For each i_w in [1, W), compute dh0[i_n, :, i_w]
+    for i_w in tl.static_range(1, W):
+        b_dh0 = tl.zeros([BD], dtype=tl.float32)
+
+        # Accumulate contributions from t = 0 to min(i_w, seq_len) - 1
+        for t in tl.static_range(0, W - 1):
+            if t < i_w:
+                w_idx = i_w - 1 - t
+
+                # Load dy[t, :] relative to dy_base
+                p_dy = dy_base + t * stride_dy_t + o_d
+                m_t = (t < seq_len) & m_d
+                b_dy = tl.load(p_dy, mask=m_t, other=0).to(tl.float32)
+
+                if USE_ACTIVATION:
+                    if IS_VARLEN:
+                        p_y = y + bos * stride_dy_t + t * stride_dy_t + o_d
+                    else:
+                        p_y = y + i_n * stride_dy_n + t * stride_dy_t + o_d
+                    b_y = tl.load(p_y, mask=m_t, other=0).to(tl.float32)
+                    b_ys = tl.sigmoid(b_y)
+                    b_dy = b_dy * b_ys * (1 + b_y * (1 - b_ys))
+
+                # Get weight[:, w_idx]
+                b_w_col = tl.load(weight + o_d * W + w_idx, mask=m_d, other=0).to(tl.float32)
+
+                # Accumulate
+                b_dh0 += tl.where(m_t, b_dy * b_w_col, 0)
+
+        # Store dh0[i_n, :, i_w]
+        p_dh0 = dh0 + i_n * D * W + o_d * W + i_w
+        tl.store(p_dh0, b_dh0.to(dh0.dtype.element_ty), mask=m_d)
+
+
+def compute_dh0_triton(
+    dy: torch.Tensor,
+    y: torch.Tensor | None,
+    weight: torch.Tensor,
+    initial_state: torch.Tensor,
+    activation: str | None,
+    cu_seqlens: torch.Tensor | None,
+) -> torch.Tensor:
+    """
+    Compute dh0 (gradient w.r.t. initial_state) using a separate Triton kernel.
+    This is a workaround for Triton compiler bugs on some architectures (e.g., GB200).
+    """
+    D, W = weight.shape
+    N = initial_state.shape[0]
+    T = dy.shape[1]
+
+    # Initialize dh0
+    dh0 = torch.zeros_like(initial_state)
+
+    BD = 32
+    grid = (triton.cdiv(D, BD), N)
+
+    y_to_pass = y if activation in ('swish', 'silu') else None
+    # dy is [B, T, D], stride_n = T*D, stride_t = D
+    stride_dy_n = dy.stride(0)
+    stride_dy_t = dy.stride(1)
+
+    compute_dh0_kernel[grid](
+        dy=dy,
+        y=y_to_pass,
+        weight=weight,
+        dh0=dh0,
+        cu_seqlens=cu_seqlens,
+        stride_dy_n=stride_dy_n,
+        stride_dy_t=stride_dy_t,
+        T=T,
+        D=D,
+        W=W,
+        BD=BD,
+    )
+
+    return dh0
+
+
 def causal_conv1d_bwd(
     x: torch.Tensor,
     dy: torch.Tensor,
@@ -549,7 +644,6 @@ def causal_conv1d_bwd(
     dw = weight.new_empty(B*NT, *weight.shape, dtype=torch.float) if weight is not None else None
     db = bias.new_empty(B*NT, *bias.shape, dtype=torch.float) if bias is not None else None
     dr = dy if residual is not None else None
-    dh0 = initial_state.new_zeros(min(NT, triton.cdiv(W, BT)), *initial_state.shape) if initial_state is not None else None
 
     stride_dx_n, stride_dx_t, stride_dx_d = dx.stride()
 
@@ -559,7 +653,6 @@ def causal_conv1d_bwd(
         y=y,
         weight=weight,
         initial_state=initial_state,
-        dh0=dh0,
         dht=dht,
         dy=dy,
         dx=dx,
@@ -586,8 +679,18 @@ def causal_conv1d_bwd(
         dw = dw.sum(0).to(weight)
     if bias is not None:
         db = db.sum(0).to(bias)
+
+    # Compute dh0 using separate Triton kernel to avoid compiler bugs on some architectures (e.g., GB200)
+    dh0 = None
     if initial_state is not None:
-        dh0 = dh0.sum(0, dtype=torch.float32).to(initial_state)
+        dh0 = compute_dh0_triton(
+            dy=dy,
+            y=y,
+            weight=weight,
+            initial_state=initial_state,
+            activation=activation,
+            cu_seqlens=cu_seqlens,
+        )
 
     return dx.view(shape), dw, db, dr, dh0
 
@@ -1000,6 +1103,7 @@ def causal_conv1d(
     cu_seqlens: torch.Tensor | None = None,
     cu_seqlens_cpu: torch.LongTensor | None = None,
     chunk_indices: torch.LongTensor | None = None,
+    cp_context: FLACPContext | None = None,
     **kwargs,
 ):
     """
@@ -1038,6 +1142,21 @@ def causal_conv1d(
         Tuple of (output, final_state).
         If `output_final_state` is `False`, the final state is `None`.
     """
+    if cp_context is not None:
+        assert initial_state is None, "Initial state is not supported for CP"
+        assert output_final_state is False, "Output final state is not supported for CP"
+        assert cu_seqlens is not None, "cu_seqlens is required for CP"
+        output = causal_conv1d_cp(
+            x=x,
+            weight=weight,
+            bias=bias,
+            activation=activation,
+            cu_seqlens=cu_seqlens,
+            cu_seqlens_cpu=cu_seqlens_cpu,
+            chunk_indices=chunk_indices,
+            cp_context=cp_context,
+        )
+        return output, None
 
     if backend == 'triton':
         y, final_state = CausalConv1dFunction.apply(
@@ -1511,3 +1630,218 @@ class ImplicitLongConvolution(nn.Module):
 
         y = y.transpose(1, 2)
         return y.to(dtype=x.dtype)
+
+
+# CP Related Conv1d Functions
+
+class CausalConv1dFunctionCP(torch.autograd.Function):
+    """
+    Context Parallel version of CausalConv1dFunction.
+
+    Forward:
+        1. Get tails from previous rank to construct initial_state
+        2. Call causal_conv1d_fwd
+
+    Backward:
+        1. Call causal_conv1d_bwd to get dx
+        2. Sync communication: add next rank's first W-1 token gradients to current rank's last W-1 tokens
+    """
+
+    @staticmethod
+    def _prepare_initial_state_for_cp(
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        cu_seqlens: torch.Tensor | None,
+        context: FLACPContext,
+        group: dist.ProcessGroup | None,
+    ) -> torch.Tensor | None:
+        """Prepare initial_state for CP forward pass by communicating with previous rank.
+
+        Args:
+            x: Input tensor of shape [1, T, D]
+            weight: Weight tensor of shape [D, W]
+            cu_seqlens: Cumulative sequence lengths
+            context: CP context
+            group: Process group for communication
+
+        Returns:
+            initial_state: Initial state tensor of shape [N, D, W] or None
+        """
+        if group is None:
+            return None
+
+        W = weight.shape[-1]  # weight: [D, W]
+        D = weight.shape[0]
+        initial_state = None
+        if not context.is_first_rank:
+            # Non-first rank needs initial_state
+            assert x.dim() == 3 and x.shape[0] == 1, f"CP requires [1, T, D], got {x.shape}"
+            x_2d = x.squeeze(0)  # [T, D]
+            tails = x_2d[-(W-1):].contiguous()  # [W-1, D]
+            heads = conv_cp_send_recv_fwd(tails, group)  # [W-1, D]
+            # Construct initial_state: [N, D, W]
+            N = len(cu_seqlens) - 1
+            initial_state = torch.zeros(N, D, W, device=x.device, dtype=x.dtype)
+            valid_len = min(W - 1, context.pre_num_conv_tokens)
+            if valid_len > 0:
+                # heads[-valid_len:]: [valid_len, D] -> [D, valid_len]
+                initial_state[0, :, -valid_len:] = heads[-valid_len:].T
+        else:
+            # First rank also needs to participate in communication (send tails)
+            x_2d = x.squeeze(0)
+            tails = x_2d[-(W-1):].contiguous()
+            _ = conv_cp_send_recv_fwd(tails, group)  # Send but don't use
+
+        return initial_state
+
+    @staticmethod
+    def _correct_dx_for_cp(
+        dx: torch.Tensor,
+        dh0: torch.Tensor | None,
+        W: int,
+        group: dist.ProcessGroup | None,
+        is_first_rank: bool,
+    ) -> None:
+        """Correct dx gradients for CP backward pass by communicating with next rank.
+
+        Args:
+            dx: Gradient tensor to be corrected, shape [1, T, D]
+            dh0: Gradient w.r.t. initial_state, shape [N, D, W] or None
+            W: Kernel size
+            group: Process group for communication
+            is_first_rank: Whether this is the first rank in the sequence's processing chain
+        """
+        if group is None:
+            return
+
+        D = dx.shape[-1]
+        # dh0: [N, D, W] or None
+        # We only care about the first sequence's initial_state gradient
+        if dh0 is not None:
+            # Get first sequence's d_initial_state: [D, W] -> last W-1 cols -> [D, W-1] -> [W-1, D]
+            d_initial_state = dh0[0, :, -(W-1):].T.contiguous()  # [W-1, D]
+        else:
+            # dh0 is None only when this is the first rank (no initial_state needed)
+            assert is_first_rank, "dh0 should not be None when is_first_rank=False"
+            d_initial_state = torch.zeros(W-1, D, device=dx.device, dtype=dx.dtype)
+        # Sync communication: send d_initial_state to previous rank, receive from next rank
+        recv_d_init = conv_cp_send_recv_bwd(d_initial_state, group)  # [W-1, D]
+        # Add to current rank's last W-1 tokens (these tokens are used as initial_state by next rank)
+        dx[0, -(W-1):, :].add_(recv_d_init)
+
+    @staticmethod
+    def forward(
+        ctx,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor | None,
+        activation: str | None,
+        cu_seqlens: torch.Tensor | None,
+        cu_seqlens_cpu: torch.Tensor | None,
+        chunk_indices: torch.Tensor | None,
+        cp_context: FLACPContext | None,
+    ):
+        if cp_context is None:
+            raise ValueError("cp_context must be provided for CausalConv1dFunctionCP")
+        group = cp_context.group
+
+        # Get kernel_size
+        W = weight.shape[-1]  # weight: [D, W]
+        # Prepare initial_state for CP
+        initial_state = CausalConv1dFunctionCP._prepare_initial_state_for_cp(
+            x=x,
+            weight=weight,
+            cu_seqlens=cu_seqlens,
+            context=cp_context,
+            group=group,
+        )
+
+        ctx.save_for_backward(x, weight, bias, initial_state)
+        ctx.activation = activation
+        ctx.cu_seqlens = cu_seqlens
+        ctx.cu_seqlens_cpu = cu_seqlens_cpu
+        ctx.chunk_indices = chunk_indices
+        ctx.group = group
+        ctx.W = W
+        ctx.is_first_rank = cp_context.is_first_rank
+
+        # Call original forward
+        y, _ = causal_conv1d_fwd(
+            x=x,
+            weight=weight,
+            bias=bias,
+            residual=None,
+            initial_state=initial_state,
+            output_final_state=False,
+            activation=activation,
+            cu_seqlens=cu_seqlens,
+            cu_seqlens_cpu=cu_seqlens_cpu,
+            chunk_indices=chunk_indices,
+        )
+
+        return y
+
+    @staticmethod
+    def backward(ctx, dy: torch.Tensor):
+        x, weight, bias, initial_state = ctx.saved_tensors
+        group = ctx.group
+        W = ctx.W
+
+        # Call original backward
+        dx, dw, db, _, dh0 = causal_conv1d_bwd(
+            x=x,
+            dy=dy,
+            dht=None,
+            weight=weight,
+            bias=bias,
+            residual=None,
+            initial_state=initial_state,
+            activation=ctx.activation,
+            cu_seqlens=ctx.cu_seqlens,
+            cu_seqlens_cpu=ctx.cu_seqlens_cpu,
+            chunk_indices=ctx.chunk_indices,
+        )
+
+        # Correct dx gradients for CP
+        CausalConv1dFunctionCP._correct_dx_for_cp(
+            dx=dx,
+            dh0=dh0,
+            W=W,
+            group=group,
+            is_first_rank=ctx.is_first_rank,
+        )
+
+        return dx, dw, db, None, None, None, None, None
+
+
+def causal_conv1d_cp(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    activation: str | None = None,
+    cu_seqlens: torch.Tensor | None = None,
+    cu_seqlens_cpu: torch.Tensor | None = None,
+    chunk_indices: torch.Tensor | None = None,
+    cp_context: FLACPContext | None = None,
+):
+    """
+    Context Parallel version of causal_conv1d.
+
+    Automatically handles communication in CP environment:
+    - Forward: get initial_state from previous rank
+    - Backward: correct dx gradients
+
+    Args:
+        x: Input tensor of shape [1, T, D]
+        weight: Weight tensor of shape [D, W]
+        bias: Bias tensor of shape [D] or None
+        activation: Activation function name or None
+        cu_seqlens: Cumulative sequence lengths
+        cu_seqlens_cpu: Cumulative sequence lengths on CPU
+        chunk_indices: Chunk indices for variable-length sequences
+        cp_context: CP context (required for CP mode)
+    """
+    return CausalConv1dFunctionCP.apply(
+        x, weight, bias, activation,
+        cu_seqlens, cu_seqlens_cpu, chunk_indices, cp_context
+    )
