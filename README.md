@@ -72,6 +72,19 @@ Times are in milliseconds; lower is better.
 | B=4, T=16384, H=8, K=128, V=128 | 41.782 | 27.228 | 1.53x |
 | B=4, T=16384, H=8, K=256, V=256 | 152.542 | 130.389 | 1.17x |
 
+### Performance Analysis (Matched Configuration)
+
+We also conducted a controlled experiment where both Triton and cuTile implementations were forced to use the **exact same block size configurations** (e.g., BK, BV, and Chunk Size) to exclude the impact of autotuning.
+
+*   **Recurrent Mode**:
+    *   For **short sequences** (e.g., T=512), **cuTile outperforms Triton** by roughly **1.5x - 1.8x**. This is likely due to lower kernel launch overhead and efficient loop structures for small workloads in the pure CUDA/C++ backend.
+    *   For **long sequences** (e.g., T≥2048), **Triton takes the lead**, outperforming cuTile by about **1.4x**. Triton's compiler optimizations (e.g., pipeline, memory coalescing) shine in compute-bound scenarios.
+
+*   **Chunk Mode**:
+    *   **Triton is significantly faster** (10x+ speedup) than the current cuTile implementation even with matched configurations.
+    *   **Reason**: The current cuTile chunk implementation lacks **software pipelining**. It sequentially loads data and computes, whereas Triton automatically pipelines global memory loads with computation, hiding memory latency. This difference is critical for the matrix-multiplication-heavy chunk mode.
+
+
 
 
 ><div align="center">
