@@ -15,6 +15,7 @@ We are exploring the use of [cuTile](https://github.com/NVIDIA/cutile-python), a
 ### Implemented Operators
 
 - **Recurrent Linear Attention**: A recurrent implementation of linear attention supporting both fixed-length and variable-length (`varlen`) inputs.
+- **Chunked Linear Attention**: A chunked implementation of linear attention supporting fixed-length and packed `varlen` inputs.
 
 ### Running Tests
 
@@ -23,6 +24,7 @@ To verify the correctness of the cuTile implementations:
 ```sh
 # you might have to first install `fla` to enable its import via `pip install -e .`
 pytest tests/cutile/ops/test_recurrent.py
+pytest tests/cutile/ops/test_chunk.py
 ```
 
 ### Running Benchmarks
@@ -31,8 +33,44 @@ To compare the performance of cuTile implementations with Naive (PyTorch) and Tr
 
 ```sh
 # you might have to first install `fla` to enable its import via `pip install -e .`
-python -m benchmarks.ops.benchmark_cutile_recurrent
+python -m benchmarks.ops.benchmark_cutile_recurrent_table
+python -m benchmarks.ops.benchmark_cutile_chunk_table
 ```
+
+### Recent cuTile Benchmarks
+
+Local benchmark outputs from `benchmarks/ops/benchmark_cutile_recurrent_table.py` and `benchmarks/ops/benchmark_cutile_chunk_table.py` on *RTX 5070 Laptop*.
+Times are in milliseconds; lower is better.
+
+**Recurrent linear attention**
+
+| Config | Triton (ms) | cuTile (ms) | Speedup |
+| :----- | ----------: | ----------: | ------: |
+| B=2, T=128, H=4, K=32, V=32 | 0.079 | 0.049 | 1.62x |
+| B=2, T=512, H=4, K=64, V=64 | 0.530 | 0.191 | 2.78x |
+| B=4, T=1024, H=8, K=64, V=64 | 1.126 | 0.506 | 2.22x |
+| B=4, T=2048, H=8, K=128, V=128 | 2.653 | 2.234 | 1.19x |
+| B=4, T=4096, H=8, K=128, V=128 | 5.317 | 4.505 | 1.18x |
+| B=4, T=4096, H=8, K=256, V=256 | 17.271 | 24.658 | 0.70x |
+| B=4, T=8192, H=8, K=128, V=128 | 10.857 | 9.518 | 1.14x |
+| B=4, T=8192, H=8, K=256, V=256 | 36.921 | 52.991 | 0.70x |
+| B=4, T=16384, H=8, K=128, V=128 | 23.195 | 18.992 | 1.22x |
+| B=4, T=16384, H=8, K=256, V=256 | 69.670 | 102.514 | 0.68x |
+
+**Chunked linear attention**
+
+| Config | Triton (ms) | cuTile (ms) | Speedup |
+| :----- | ----------: | ----------: | ------: |
+| B=2, T=128, H=4, K=32, V=32 | 0.033 | 0.018 | 1.78x |
+| B=2, T=512, H=4, K=64, V=64 | 0.349 | 0.071 | 4.94x |
+| B=4, T=1024, H=8, K=64, V=64 | 1.292 | 0.408 | 3.17x |
+| B=4, T=2048, H=8, K=128, V=128 | 4.998 | 3.380 | 1.48x |
+| B=4, T=4096, H=8, K=128, V=128 | 9.937 | 6.763 | 1.47x |
+| B=4, T=4096, H=8, K=256, V=256 | 37.614 | 24.435 | 1.54x |
+| B=4, T=8192, H=8, K=128, V=128 | 19.737 | 13.557 | 1.46x |
+| B=4, T=8192, H=8, K=256, V=256 | 80.119 | 49.203 | 1.63x |
+| B=4, T=16384, H=8, K=128, V=128 | 41.782 | 27.228 | 1.53x |
+| B=4, T=16384, H=8, K=256, V=256 | 152.542 | 130.389 | 1.17x |
 
 
 
