@@ -46,46 +46,102 @@ Times are in milliseconds; lower is better.
 
 | Config | Triton (ms) | cuTile (ms) | Speedup |
 | :----- | ----------: | ----------: | ------: |
-| B=2, T=128, H=4, K=32, V=32 | 0.079 | 0.049 | 1.62x |
-| B=2, T=512, H=4, K=64, V=64 | 0.530 | 0.191 | 2.78x |
-| B=4, T=1024, H=8, K=64, V=64 | 1.126 | 0.506 | 2.22x |
-| B=4, T=2048, H=8, K=128, V=128 | 2.653 | 2.234 | 1.19x |
-| B=4, T=4096, H=8, K=128, V=128 | 5.317 | 4.505 | 1.18x |
-| B=4, T=4096, H=8, K=256, V=256 | 17.271 | 24.658 | 0.70x |
-| B=4, T=8192, H=8, K=128, V=128 | 10.857 | 9.518 | 1.14x |
-| B=4, T=8192, H=8, K=256, V=256 | 36.921 | 52.991 | 0.70x |
-| B=4, T=16384, H=8, K=128, V=128 | 23.195 | 18.992 | 1.22x |
-| B=4, T=16384, H=8, K=256, V=256 | 69.670 | 102.514 | 0.68x |
+| B=1, T=512, H=4, K=32, V=32 | 0.544 | 0.535 | 1.02x |
+| B=1, T=1024, H=4, K=32, V=32 | 1.070 | 1.059 | 1.01x |
+| B=1, T=2048, H=4, K=32, V=32 | 2.074 | 2.101 | 0.99x |
+| B=1, T=4096, H=4, K=32, V=32 | 4.114 | 4.200 | 0.98x |
+| B=1, T=8192, H=4, K=32, V=32 | 8.266 | 8.388 | 0.99x |
+| B=1, T=512, H=4, K=64, V=64 | 1.055 | 0.546 | 1.93x |
+| B=1, T=2048, H=4, K=64, V=64 | 4.052 | 2.127 | 1.90x |
+| B=1, T=4096, H=4, K=64, V=64 | 8.080 | 4.240 | 1.91x |
+| B=1, T=8192, H=4, K=64, V=64 | 16.110 | 8.465 | 1.90x |
+| B=1, T=512, H=4, K=64, V=128 | 1.060 | 0.548 | 1.93x |
+| B=1, T=2048, H=4, K=64, V=128 | 4.250 | 2.134 | 1.99x |
+| B=1, T=4096, H=4, K=64, V=128 | 8.436 | 4.252 | 1.98x |
+| B=1, T=8192, H=4, K=64, V=128 | 16.929 | 8.503 | 1.99x |
+| B=1, T=512, H=4, K=128, V=128 | 1.033 | 0.548 | 1.89x |
+| B=1, T=2048, H=4, K=128, V=128 | 4.058 | 2.141 | 1.90x |
+| B=1, T=4096, H=4, K=128, V=128 | 8.075 | 4.304 | 1.88x |
+| B=1, T=8192, H=4, K=128, V=128 | 16.153 | 8.635 | 1.87x |
 
 **Chunked linear attention**
 
 | Config | Triton (ms) | cuTile (ms) | Speedup |
 | :----- | ----------: | ----------: | ------: |
-| B=2, T=128, H=4, K=32, V=32 | 0.033 | 0.018 | 1.78x |
-| B=2, T=512, H=4, K=64, V=64 | 0.349 | 0.071 | 4.94x |
-| B=4, T=1024, H=8, K=64, V=64 | 1.292 | 0.408 | 3.17x |
-| B=4, T=2048, H=8, K=128, V=128 | 4.998 | 3.380 | 1.48x |
-| B=4, T=4096, H=8, K=128, V=128 | 9.937 | 6.763 | 1.47x |
-| B=4, T=4096, H=8, K=256, V=256 | 37.614 | 24.435 | 1.54x |
-| B=4, T=8192, H=8, K=128, V=128 | 19.737 | 13.557 | 1.46x |
-| B=4, T=8192, H=8, K=256, V=256 | 80.119 | 49.203 | 1.63x |
-| B=4, T=16384, H=8, K=128, V=128 | 41.782 | 27.228 | 1.53x |
-| B=4, T=16384, H=8, K=256, V=256 | 152.542 | 130.389 | 1.17x |
-
-### Performance Analysis (Matched Configuration)
-
-We also conducted a controlled experiment where both Triton and cuTile implementations were forced to use the **exact same block size configurations** (e.g., BK, BV, and Chunk Size) to exclude the impact of autotuning.
-
-*   **Recurrent Mode**:
-    *   For **short sequences** (e.g., T=512), **cuTile outperforms Triton** by roughly **1.5x - 1.8x**. This is likely due to lower kernel launch overhead and efficient loop structures for small workloads in the pure CUDA/C++ backend.
-    *   For **long sequences** (e.g., T≥2048), **Triton takes the lead**, outperforming cuTile by about **1.4x**. Triton's compiler optimizations (e.g., pipeline, memory coalescing) shine in compute-bound scenarios.
-
-*   **Chunk Mode**:
-    *   **Triton is significantly faster** (10x+ speedup) than the current cuTile implementation even with matched configurations.
-    *   **Reason**: The current cuTile chunk implementation lacks **software pipelining**. It sequentially loads data and computes, whereas Triton automatically pipelines global memory loads with computation, hiding memory latency. This difference is critical for the matrix-multiplication-heavy chunk mode.
+| B=1, T=512, H=4, K=32, V=32 | 0.055 | 0.044 | 1.25x |
+| B=1, T=1024, H=4, K=32, V=32 | 0.103 | 0.079 | 1.30x |
+| B=1, T=2048, H=4, K=32, V=32 | 0.199 | 0.135 | 1.47x |
+| B=1, T=4096, H=4, K=32, V=32 | 0.389 | 0.261 | 1.49x |
+| B=1, T=8192, H=4, K=32, V=32 | 0.756 | 0.512 | 1.48x |
+| B=1, T=512, H=4, K=64, V=64 | 0.077 | 0.054 | 1.42x |
+| B=1, T=2048, H=4, K=64, V=64 | 0.280 | 0.152 | 1.85x |
+| B=1, T=4096, H=4, K=64, V=64 | 0.549 | 0.290 | 1.89x |
+| B=1, T=8192, H=4, K=64, V=64 | 1.080 | 0.566 | 1.91x |
+| B=1, T=512, H=4, K=64, V=128 | 0.078 | 0.046 | 1.70x |
+| B=1, T=2048, H=4, K=64, V=128 | 0.283 | 0.150 | 1.88x |
+| B=1, T=4096, H=4, K=64, V=128 | 0.547 | 0.290 | 1.89x |
+| B=1, T=8192, H=4, K=64, V=128 | 1.080 | 0.565 | 1.91x |
+| B=1, T=512, H=4, K=128, V=128 | 0.092 | 0.082 | 1.13x |
+| B=1, T=2048, H=4, K=128, V=128 | 0.317 | 0.261 | 1.22x |
+| B=1, T=4096, H=4, K=128, V=128 | 0.605 | 0.505 | 1.20x |
+| B=1, T=8192, H=4, K=128, V=128 | 1.210 | 1.008 | 1.20x |
 
 
 
+### Ablation: Inference-Only Chunk + Recurrent (TF32)
+
+The following ablation focuses on **inference-only** (B=1) configs on *RTX 5070 Laptop* using
+`benchmarks/ops/benchmark_reproduce.py`.
+Speedup columns are **Triton / cuTile**, so values **>1** mean cuTile is faster.
+For **packed-K**, the table excludes the one-time `k` packing cost (only kernel time is measured).
+
+**Chunk (TF32, inference-only)**
+
+Notes:
+*   The chunk ablation uses **fixed tiles** and fixes **H=4** to avoid sweeping head count.
+*   The `Dtype=tf32` label means the compute path uses TF32 (Tensor Core) for `f32xf32` matmuls where applicable.
+
+| Config | Tile (BT,BK,BV) | Triton (ms) | cuTile (ms) | split (ms) | packed-K (ms) | Spd | Split | Pack |
+| :----- | :-------------- | ----------: | ----------: | ---------: | ------------: | ---: | ----: | ---: |
+| B=1, T=1024, H=4, K=64, V=64 | 32,64,64 | 0.251 | 0.176 | 0.216 | 0.162 | 1.42 | 1.16 | 1.55 |
+| B=1, T=1024, H=4, K=64, V=128 | 32,64,64 | 0.254 | 0.176 | 0.219 | 0.161 | 1.44 | 1.16 | 1.57 |
+| B=1, T=4096, H=4, K=64, V=64 | 32,64,64 | 0.965 | 0.668 | 0.799 | 0.603 | 1.44 | 1.21 | 1.60 |
+| B=1, T=4096, H=4, K=64, V=128 | 32,64,64 | 0.978 | 0.668 | 0.812 | 0.604 | 1.46 | 1.20 | 1.62 |
+| B=1, T=16384, H=4, K=64, V=64 | 32,64,64 | 3.820 | 2.633 | 3.207 | 2.366 | 1.45 | 1.19 | 1.61 |
+
+**Recurrent (TF32, inference-only)**
+
+| Config | BK,BV | Triton (ms) | cuTile (ms) | Speedup |
+| :----- | :---- | ----------: | ----------: | ------: |
+| B=1, T=1024, H=8, K=64, V=64 | 32,64 | 1.658 | 1.080 | 1.54 |
+| B=1, T=1024, H=16, K=64, V=64 | 64,64 | 2.059 | 1.566 | 1.31 |
+| B=1, T=4096, H=8, K=64, V=64 | 32,64 | 6.504 | 4.266 | 1.52 |
+| B=1, T=8192, H=16, K=64, V=128 | 32,64 | 12.853 | 11.696 | 1.10 |
+
+#### Summary
+
+*   **Chunk**: with Triton using `tl.dot` default TF32 behavior (no explicit value rounding), speedups are typically **~0.7x–1.6x** depending on tile choice and `V`.
+*   **packed-K**: usually the fastest variant for `V<=64` (up to **~1.6x** in this table).
+*   **BV=128**: some tile choices regress (<1x) due to higher memory pressure.
+*   **Recurrent**: cuTile speedup is modest (**~1.1x–1.6x**) for the reduced inference set.
+*   **Correctness**: chunk vs cuTile max diff is **~7.3e-2** (T=128), recurrent max diff is **~1e-5**.
+
+#### Configuration Definitions
+
+*   **cuTile (ms)**: The standard cuTile implementation using mixed precision (TF32 for matmul, FP32 for accumulation) where applicable.
+*   **split (ms)**: A variant that splits the computation along the sequence length (intra-chunk) to increase parallelism. This is particularly useful for long sequences where a single kernel might be under-utilized or register-bound.
+*   **packed-K (ms)**: A variant where the Key (`K`) tensor is pre-packed into a memory layout that avoids on-the-fly transposition during the kernel execution. The reported time **excludes** the packing overhead, representing the theoretical peak performance if the model architecture maintains `K` in this packed format.
+*   **Spd**: Speedup of the standard `cuTile` implementation relative to `Triton` (Triton / cuTile).
+*   **Split**: Speedup of the `split` variant relative to `Triton`.
+*   **Pack**: Speedup of the `packed-K` variant relative to `Triton`.
+
+#### TF32 Rounding Note (Triton vs cuTile)
+
+For TF32 math, Triton and cuTile both use TF32 inputs and FP32 accumulation, but their *rounding behavior* can differ:
+
+*   **Triton baseline in `benchmark_reproduce.py`** relies on `tl.dot`'s default TF32 behavior on NVIDIA.
+    As noted in the Triton docs, TF32 dot may truncate to TF32 without rounding, which can bias results.
+*   **cuTile** uses `ct.tfloat32` casts inside the kernel.
 
 ><div align="center">
 >  <img width="400" alt="image" src="https://github.com/fla-org/flash-linear-attention/assets/18402347/02ff2e26-1495-4088-b701-e72cd65ac6cf">

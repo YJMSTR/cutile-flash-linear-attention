@@ -12,6 +12,7 @@ _AUTOTUNE_ENABLED = os.getenv("CUTILE_AUTOTUNE", "1") != "0"
 _AUTOTUNE_WARMUP = int(os.getenv("CUTILE_AUTOTUNE_WARMUP", "2"))
 _AUTOTUNE_ITERS = int(os.getenv("CUTILE_AUTOTUNE_ITERS", "5"))
 _AUTOTUNE_CACHE: dict[tuple, tuple[int, int]] = {}
+_MAX_KV_TILE_ELEMS = int(os.getenv("CUTILE_RECURRENT_MAX_KV_TILE_ELEMS", "4096"))
 
 
 def _select_block_kv(K: int, V: int, device: torch.device) -> tuple[int, int]:
@@ -36,10 +37,17 @@ def _select_block_kv(K: int, V: int, device: torch.device) -> tuple[int, int]:
             if BK >= 128 and V >= 64:
                 BV = min(BV, 16)
             # Keep state size reasonable.
-            if BK * BV > 2048:
+            if BK * BV > _MAX_KV_TILE_ELEMS:
                 BV = min(BV, 16)
-            if BK * BV > 2048:
+            if BK * BV > _MAX_KV_TILE_ELEMS:
                 BK = min(BK, 64)
+
+    # Global hard cap: ensure BK * BV never exceeds the limit.
+    # Keep BK/BV as powers-of-two by halving.
+    while (BK * BV) > _MAX_KV_TILE_ELEMS and BV > 16:
+        BV //= 2
+    while (BK * BV) > _MAX_KV_TILE_ELEMS and BK > 16:
+        BK //= 2
     return BK, BV
 
 
@@ -60,11 +68,20 @@ def _candidate_block_kv(K: int, V: int) -> list[tuple[int, int]]:
         candidates.add((base_BK, 32))
         
     # Also add standard safe candidates
+    # Add a balanced option within the BK*BV cap (often strong for K=128,V>=64).
+    if K >= 64 and V >= 64:
+        candidates.add((64, 64))
     candidates.add((64, 32))
     candidates.add((32, 64))
     candidates.add((32, 32))
 
-    return sorted([c for c in candidates if c[0] >= 16 and c[1] >= 16])
+    return sorted(
+        [
+            c
+            for c in candidates
+            if c[0] >= 16 and c[1] >= 16 and (c[0] * c[1]) <= _MAX_KV_TILE_ELEMS
+        ]
+    )
 
 
 def _cutile_recurrent_fwd_impl(
