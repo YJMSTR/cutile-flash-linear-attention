@@ -474,6 +474,102 @@ def test_chunk(
     assert framework_tracker.detect_triton_driver() == 'paddle'
 
 
+def test_chunk_with_torch_seed42(framework_tracker):
+    """Use torch.manual_seed(42) to generate data (matching PyTorch test_chunk B4-T2048 case),
+    then run the Paddle pipeline.  This isolates random-data effects from code differences.
+
+    PyTorch test_chunk gets dbias ratio=0.002794 with this data.
+    If Paddle code is equivalent, we should get a comparable (or better) ratio.
+    """
+    import torch
+    import torch.nn.functional as F_t
+
+    B, T, H, D = 4, 2048, 8, 64
+    scale = 0.1
+    lower_bound = -5.0
+    dtype_t = torch.float16
+
+    # ---- generate data exactly as the PyTorch test_chunk does ----
+    torch.manual_seed(42)
+    q_t = torch.rand(B, T, H, D, dtype=dtype_t)
+    k_t = torch.rand(B, T, H, D, dtype=dtype_t)
+    v_t = torch.rand(B, T, H, D, dtype=dtype_t)
+    g_t = torch.randn(B, T, H, D, dtype=dtype_t)         # use_gate_in_kernel=True → dtype
+    A_log_t = torch.randn(H, dtype=torch.float)
+    dt_bias_t = torch.randn(H * D, dtype=torch.float)
+    beta_t = torch.randn(B, T, H, dtype=dtype_t).sigmoid()
+    h0_t = torch.randn(B, H, D, D, dtype=torch.float32)
+    # PyTorch moves to CUDA before randn_like → do/dht use CUDA RNG.
+    # We replicate by moving first, then generating.
+    device = 'cuda'
+    A_log_t, dt_bias_t = A_log_t.to(device), dt_bias_t.to(device)
+    q_t, k_t, v_t, g_t, beta_t, h0_t = [x.to(device) for x in (q_t, k_t, v_t, g_t, beta_t, h0_t)]
+    do_t = torch.randn_like(v_t)
+    dht_t = torch.randn_like(h0_t)
+
+    # ---- convert to paddle ----
+    def to_pd(t):
+        return paddle.to_tensor(t.cpu().numpy())
+    q = to_pd(q_t);  k = to_pd(k_t);  v = to_pd(v_t);  g = to_pd(g_t)
+    A_log = to_pd(A_log_t);  dt_bias = to_pd(dt_bias_t)
+    beta = to_pd(beta_t);  h0 = to_pd(h0_t)
+    do = to_pd(do_t);  dht = to_pd(dht_t)
+
+    for t in [q, k, v, g, beta, h0, A_log, dt_bias]:
+        t.stop_gradient = False
+
+    # ---- naive reference ----
+    ref, ref_ht = naive_recurrent_kda(
+        q=F.normalize(q.clone(), p=2, axis=-1),
+        k=F.normalize(k.clone(), p=2, axis=-1),
+        v=v.clone(),
+        g=naive_kda_lowerbound_gate(g, A_log, dt_bias, lower_bound=lower_bound),
+        beta=beta.clone(), scale=scale,
+        initial_state=h0.clone(), output_final_state=True,
+    )
+    ((ref * do).sum() + (ref_ht * dht).sum()).backward(retain_graph=True)
+    ref_dA = A_log.grad.clone();  A_log.clear_gradient()
+    ref_dbias = dt_bias.grad.clone();  dt_bias.clear_gradient()
+    ref_dq, ref_dk, ref_dv, ref_dg, ref_db, ref_dh0 = (
+        q.grad.clone(), k.grad.clone(), v.grad.clone(),
+        g.grad.clone(), beta.grad.clone(), h0.grad.clone(),
+    )
+    for t in [q, k, v, g, beta, h0]:
+        t.clear_gradient()
+
+    # ---- triton (chunk) path ----
+    tri, tri_ht = chunk_kda(
+        q=F.normalize(q.clone(), p=2, axis=-1),
+        k=F.normalize(k.clone(), p=2, axis=-1),
+        v=v.clone(), g=g.clone(), beta=beta.clone(),
+        A_log=A_log.clone(), dt_bias=dt_bias.clone(),
+        scale=scale, initial_state=h0.clone(), output_final_state=True,
+        use_qk_l2norm_in_kernel=False, use_gate_in_kernel=True,
+        safe_gate=True, lower_bound=lower_bound, disable_recompute=True,
+    )
+    ((tri * do).sum() + (tri_ht * dht).sum()).backward(retain_graph=True)
+    tri_dA = A_log.grad.clone()
+    tri_dbias = dt_bias.grad.clone()
+    tri_dq, tri_dk, tri_dv, tri_dg, tri_db, tri_dh0 = (
+        q.grad.clone(), k.grad.clone(), v.grad.clone(),
+        g.grad.clone(), beta.grad.clone(), h0.grad.clone(),
+    )
+
+    # ---- assertions (same tolerances as test_chunk / PyTorch upstream) ----
+    assert_close("o",     ref,      tri,      0.005)
+    assert_close("ht",    ref_ht,   tri_ht,   0.005)
+    assert_close("dq",    ref_dq,   tri_dq,   0.008)
+    assert_close("dk",    ref_dk,   tri_dk,   0.008)
+    assert_close("dv",    ref_dv,   tri_dv,   0.008)
+    assert_close("dg",    ref_dg,   tri_dg,   0.02)
+    assert_close("db",    ref_db,   tri_db,   0.02)
+    assert_close("dA",    ref_dA,   tri_dA,   0.003, warning=True)
+    assert_close("dbias", ref_dbias, tri_dbias, 0.008)
+    assert_close("dh0",   ref_dh0,  tri_dh0,  0.008)
+    assert framework_tracker.detect_tensor_framework(tri) == 'paddle'
+    assert framework_tracker.detect_triton_driver() == 'paddle'
+
+
 @pytest.mark.parametrize(
     ("B", "T", "H", "D", "scale", "gate_logit_normalizer", "dtype"),
     [
