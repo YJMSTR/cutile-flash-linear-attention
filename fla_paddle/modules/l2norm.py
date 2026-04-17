@@ -163,7 +163,6 @@ def l2norm_fwd(
     if D <= 512:
         # NOTE(tylerr): Avoid excessive recompilation and autotuning by tolerating a larger range
         # of T before recompiling the kernel.
-        # NB = triton.cdiv(T, 2048)
         NB = triton.cdiv(T, 2048 * 32)
 
         def grid(meta):
@@ -211,9 +210,6 @@ def l2norm_bwd(
         raise RuntimeError("This layer norm doesn't support feature dim >= 64KB.")
 
     if D <= 512:
-        # NOTE(tylerr): Avoid excessive recompilation and autotuning by tolerating a larger range
-        # of T before recompiling the kernel.
-        # NB = triton.cdiv(T, 2048)
         NB = triton.cdiv(T, 2048 * 32)
 
         def grid(meta):

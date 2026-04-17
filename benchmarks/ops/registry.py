@@ -298,6 +298,34 @@ register_op(OpConfig(
     category='gate_beta',
 ))
 
+register_op(OpConfig(
+    name='recurrent_gdn',
+    import_path='fla.ops.gated_delta_rule',
+    inputs={
+        **_simple_qkv,
+        'g': TensorSpec(shape_BTH, transform=logsigmoid),
+        'beta': TensorSpec(shape_BTH, transform=sigmoid_transform),
+    },
+    func_name='fused_recurrent_gated_delta_rule',
+    extra_kwargs={'use_qk_l2norm_in_kernel': True},
+    skip_backward=True,
+    category='gate_beta',
+))
+
+register_op(OpConfig(
+    name='recurrent_kda',
+    import_path='fla.ops.kda',
+    inputs={
+        **_simple_qkv,
+        'g': TensorSpec(shape_BTHD, transform=logsigmoid),
+        'beta': TensorSpec(shape_BTH, transform=sigmoid_transform),
+    },
+    func_name='fused_recurrent_kda',
+    extra_kwargs={'use_qk_l2norm_in_kernel': True, 'safe_gate': True, 'lower_bound': -5},
+    skip_backward=True,
+    category='gate_beta',
+))
+
 # --- E: +head gate (g=[B,T,H] with logsigmoid) ---
 
 register_op(OpConfig(

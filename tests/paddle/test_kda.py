@@ -2,16 +2,337 @@
 # Tests for KDA (Kimi Delta Attention) operators on PaddlePaddle
 # Aligned with tests/ops/test_kda.py
 
+import importlib
+from types import SimpleNamespace
+
 import paddle
 import paddle.nn.functional as F
 import pytest
 
+import fla_paddle.utils as paddle_utils
+import fla_paddle.ops.kda.chunk as chunk_module
+import fla_paddle.ops.kda.chunk_bwd as chunk_bwd_module
+import fla_paddle.ops.kda.chunk_intra as chunk_intra_module
+import fla_paddle.ops.kda.wy_fast as wy_fast_module
 from fla_paddle.ops.kda import chunk_kda, fused_recurrent_kda
 from fla_paddle.ops.kda.fused_recurrent import fused_recurrent_kda_fwd
 from fla_paddle.ops.kda.gate import fused_kda_gate, naive_kda_gate, naive_kda_lowerbound_gate
 from fla_paddle.ops.kda.naive import naive_chunk_kda, naive_recurrent_kda
 
 from .conftest import assert_close
+
+
+def test_chunk_kda_forward_enters_driver_fastpath_scope(monkeypatch):
+    calls = {'driver': 0, 'fastpath': 0}
+
+    class Ctx:
+        def __init__(self, key):
+            self.key = key
+
+        def __enter__(self):
+            calls[self.key] += 1
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    def fake_chunk_kda_fwd(**kwargs):
+        q = kwargs['q']
+        k = kwargs['k']
+        v = kwargs['v']
+        g = kwargs['g']
+        B, T, H, K = q.shape
+        V = v.shape[-1]
+        o = paddle.zeros_like(v)
+        g_cumsum = paddle.zeros_like(g)
+        Aqk = paddle.zeros([B, T, H, K], dtype=paddle.float32)
+        Akk = paddle.zeros([B, T, H, K], dtype=paddle.float32)
+        w = paddle.ones([B, T, H, V], dtype=v.dtype)
+        u = paddle.ones([B, T, H, V], dtype=v.dtype)
+        qg = paddle.ones([B, T, H, K], dtype=q.dtype)
+        kg = paddle.ones([B, T, H, K], dtype=k.dtype)
+        v_new = paddle.ones([B, T, H, V], dtype=v.dtype)
+        h = paddle.ones([B, 1, H, K, V], dtype=paddle.float32)
+        return o, None, g_cumsum, Aqk, Akk, w, u, qg, kg, v_new, h, kwargs['initial_state']
+
+    monkeypatch.setattr(chunk_module, 'activate_paddle_driver', lambda: Ctx('driver'))
+    monkeypatch.setattr(chunk_module, 'compat_kernel_wrapper_fastpath', lambda: Ctx('fastpath'))
+    monkeypatch.setattr(chunk_module, 'chunk_kda_fwd', fake_chunk_kda_fwd)
+
+    q = paddle.randn([1, 64, 2, 8], dtype=paddle.float32)
+    k = paddle.randn([1, 64, 2, 8], dtype=paddle.float32)
+    v = paddle.randn([1, 64, 2, 8], dtype=paddle.float32)
+    g = paddle.randn([1, 64, 2, 8], dtype=paddle.float32)
+    beta = paddle.randn([1, 64, 2], dtype=paddle.float32)
+    A_log = paddle.randn([2], dtype=paddle.float32)
+    dt_bias = paddle.randn([16], dtype=paddle.float32)
+
+    for tensor in [q, k, v, g, beta, A_log, dt_bias]:
+        tensor.stop_gradient = False
+
+    chunk_module.chunk_kda(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        use_qk_l2norm_in_kernel=False,
+    )
+
+    assert calls == {'driver': 1, 'fastpath': 1}
+
+
+def test_chunk_kda_bwd_wy_dqkg_fused_allocates_float32_temps_with_dtype(monkeypatch):
+    recorded = {}
+    real_empty_like = chunk_bwd_module.paddle.empty_like
+
+    def fake_empty_like(x, dtype=None, **kwargs):
+        recorded[id(x)] = dtype
+        return real_empty_like(x, dtype=dtype, **kwargs)
+
+    class FakeKernel:
+        def __getitem__(self, grid):
+            def launch(**kwargs):
+                return None
+
+            return launch
+
+    monkeypatch.setattr(chunk_bwd_module.paddle, 'empty_like', fake_empty_like)
+    monkeypatch.setattr(chunk_bwd_module, 'chunk_kda_bwd_kernel_wy_dqkg_fused', FakeKernel())
+
+    q = paddle.randn([1, 64, 2, 16], dtype=paddle.float32)
+    k = paddle.randn([1, 64, 2, 16], dtype=paddle.float32)
+    v = paddle.randn([1, 64, 2, 16], dtype=paddle.float32)
+    v_new = paddle.randn([1, 64, 2, 16], dtype=paddle.float32)
+    g = paddle.randn([1, 64, 2, 16], dtype=paddle.float32)
+    beta = paddle.randn([1, 64, 2], dtype=paddle.float32)
+    A = paddle.randn([1, 64, 2, 64], dtype=paddle.float32)
+    h = paddle.randn([1, 1, 2, 16, 16], dtype=paddle.float32)
+    do = paddle.randn([1, 64, 2, 16], dtype=paddle.float32)
+    dh = paddle.randn([1, 1, 2, 16, 16], dtype=paddle.float32)
+    dv = paddle.randn([1, 64, 2, 16], dtype=paddle.float32)
+
+    chunk_bwd_module.chunk_kda_bwd_wy_dqkg_fused(
+        q=q, k=k, v=v, v_new=v_new, g=g, beta=beta, A=A, h=h, do=do, dh=dh, dv=dv
+    )
+
+    assert recorded[id(q)] == paddle.float32
+    assert recorded[id(k)] == paddle.float32
+    assert recorded[id(g)] == paddle.float32
+    assert recorded[id(beta)] == paddle.float32
+    assert recorded[id(A)] == paddle.float32
+
+
+def test_prepare_wy_repr_bwd_allocates_float32_temps_with_dtype(monkeypatch):
+    recorded = {}
+    real_empty_like = wy_fast_module.paddle.empty_like
+
+    def fake_empty_like(x, dtype=None, **kwargs):
+        recorded[id(x)] = dtype
+        return real_empty_like(x, dtype=dtype, **kwargs)
+
+    class FakeKernel:
+        def __getitem__(self, grid):
+            def launch(**kwargs):
+                return None
+
+            return launch
+
+    monkeypatch.setattr(wy_fast_module.paddle, 'empty_like', fake_empty_like)
+    monkeypatch.setattr(wy_fast_module, 'prepare_wy_repr_bwd_kda_kernel', FakeKernel())
+    monkeypatch.setattr(wy_fast_module, 'check_shared_mem', lambda *args, **kwargs: False)
+    wy_fast_module._wy_tiling.cache_clear()
+    wy_fast_module._wy_launch_meta.cache_clear()
+
+    k = paddle.randn([1, 64, 2, 16], dtype=paddle.float32)
+    v = paddle.randn([1, 64, 2, 16], dtype=paddle.float32)
+    beta = paddle.randn([1, 64, 2], dtype=paddle.float32)
+    gk = paddle.randn([1, 64, 2, 16], dtype=paddle.float32)
+    A = paddle.randn([1, 64, 2, 64], dtype=paddle.float32)
+    dk = paddle.randn([1, 64, 2, 16], dtype=paddle.float32)
+    dw = paddle.randn([1, 64, 2, 16], dtype=paddle.float32)
+    du = paddle.randn([1, 64, 2, 16], dtype=paddle.float32)
+    dg = paddle.randn([1, 64, 2, 16], dtype=paddle.float32)
+
+    wy_fast_module.prepare_wy_repr_bwd(
+        k=k, v=v, beta=beta, gk=gk, A=A, dk=dk, dw=dw, du=du, dg=dg
+    )
+
+    assert recorded[id(dk)] == paddle.float32
+    assert recorded[id(gk)] == paddle.float32
+    assert recorded[id(A)] == paddle.float32
+    assert recorded[id(beta)] == paddle.float32
+    wy_fast_module._wy_tiling.cache_clear()
+    wy_fast_module._wy_launch_meta.cache_clear()
+
+
+def test_chunk_kda_wy_launch_meta_cached(monkeypatch):
+    calls = {'count': 0}
+
+    def fake_check_shared_mem(*args, **kwargs):
+        calls['count'] += 1
+        return False
+
+    monkeypatch.setattr(wy_fast_module, 'check_shared_mem', fake_check_shared_mem)
+    wy_fast_module._wy_tiling.cache_clear()
+    wy_fast_module._wy_launch_meta.cache_clear()
+
+    assert wy_fast_module._wy_launch_meta(0, 64, 16, 16, 64) == wy_fast_module._wy_launch_meta(0, 64, 16, 16, 64)
+    assert calls['count'] == 1
+    wy_fast_module._wy_tiling.cache_clear()
+    wy_fast_module._wy_launch_meta.cache_clear()
+
+
+def test_chunk_kda_bwd_intra_allocates_dg2_with_dtype(monkeypatch):
+    recorded = {'dtype': None}
+    real_empty_like = chunk_intra_module.paddle.empty_like
+
+    def fake_empty_like(x, dtype=None, **kwargs):
+        if x is dg:
+            recorded['dtype'] = dtype
+        return real_empty_like(x, dtype=dtype, **kwargs)
+
+    class FakeKernel:
+        def __getitem__(self, grid):
+            def launch(**kwargs):
+                return None
+
+            return launch
+
+    monkeypatch.setattr(chunk_intra_module.paddle, 'empty_like', fake_empty_like)
+    monkeypatch.setattr(chunk_intra_module, 'chunk_kda_bwd_kernel_intra', FakeKernel())
+
+    q = paddle.randn([1, 64, 2, 16], dtype=paddle.float32)
+    k = paddle.randn([1, 64, 2, 16], dtype=paddle.float32)
+    g = paddle.randn([1, 64, 2, 16], dtype=paddle.float32)
+    beta = paddle.randn([1, 64, 2], dtype=paddle.float32)
+    dAqk = paddle.randn([1, 64, 2, 64], dtype=paddle.float32)
+    dAkk = paddle.randn([1, 64, 2, 64], dtype=paddle.float32)
+    dq = paddle.randn([1, 64, 2, 16], dtype=paddle.float32)
+    dk = paddle.randn([1, 64, 2, 16], dtype=paddle.float32)
+    db = paddle.randn([1, 64, 2], dtype=paddle.float32)
+    dg = paddle.randn([1, 64, 2, 16], dtype=paddle.float32)
+
+    chunk_intra_module.chunk_kda_bwd_intra(
+        q=q, k=k, g=g, beta=beta, dAqk=dAqk, dAkk=dAkk, dq=dq, dk=dk, db=db, dg=dg
+    )
+
+    assert recorded['dtype'] == paddle.float32
+
+
+def test_check_shared_mem_falls_back_to_arch_when_paddle_props_lack_shared_mem(monkeypatch):
+    props = SimpleNamespace(
+        name='NVIDIA H800',
+        major=9,
+        minor=0,
+        total_memory=80 * 1024**3,
+        multi_processor_count=132,
+    )
+
+    monkeypatch.setattr(paddle_utils.paddle.device.cuda, 'get_device_properties', lambda: props)
+    monkeypatch.setattr(paddle_utils.paddle.device.cuda, 'get_device_capability', lambda: (9, 0))
+    monkeypatch.setattr(paddle_utils.paddle.device.cuda, 'get_device_name', lambda: 'NVIDIA H800')
+
+    assert paddle_utils.check_shared_mem()
+    assert paddle_utils.check_shared_mem('ampere')
+    assert paddle_utils.check_shared_mem('ada')
+    assert paddle_utils.check_shared_mem('hopper')
+
+
+def test_chunk_kda_candidate_lists_expand_when_arch_fallback_detects_hopper(monkeypatch):
+    props = SimpleNamespace(
+        name='NVIDIA H800',
+        major=9,
+        minor=0,
+        total_memory=80 * 1024**3,
+        multi_processor_count=132,
+    )
+
+    monkeypatch.setattr(paddle_utils.paddle.device.cuda, 'get_device_properties', lambda: props)
+    monkeypatch.setattr(paddle_utils.paddle.device.cuda, 'get_device_capability', lambda: (9, 0))
+    monkeypatch.setattr(paddle_utils.paddle.device.cuda, 'get_device_name', lambda: 'NVIDIA H800')
+
+    importlib.reload(paddle_utils)
+    importlib.reload(chunk_bwd_module)
+    try:
+        assert chunk_bwd_module.BK_LIST == [32, 64]
+        assert chunk_bwd_module.BV_LIST == [64, 128]
+    finally:
+        importlib.reload(paddle_utils)
+        importlib.reload(chunk_bwd_module)
+
+
+def test_chunk_kda_backward_skips_saved_recompute_only_tensors_when_recompute_enabled(monkeypatch):
+    captured = {}
+
+    def fake_chunk_kda_fwd(**kwargs):
+        q = kwargs['q']
+        k = kwargs['k']
+        v = kwargs['v']
+        beta = kwargs['beta']
+        g = kwargs['g']
+        B, T, H, K = q.shape
+        V = v.shape[-1]
+        o = paddle.zeros_like(v)
+        g_cumsum = paddle.zeros_like(g)
+        Aqk = paddle.zeros([B, T, H, K], dtype=paddle.float32)
+        Akk = paddle.zeros([B, T, H, K], dtype=paddle.float32)
+        w = paddle.ones([B, T, H, V], dtype=v.dtype)
+        u = paddle.ones([B, T, H, V], dtype=v.dtype) * 2
+        qg = paddle.ones([B, T, H, K], dtype=q.dtype) * 3
+        kg = paddle.ones([B, T, H, K], dtype=k.dtype) * 4
+        v_new = paddle.ones([B, T, H, V], dtype=v.dtype) * 5
+        h = paddle.ones([B, 1, H, K, V], dtype=paddle.float32) * 6
+        return o, None, g_cumsum, Aqk, Akk, w, u, qg, kg, v_new, h, kwargs['initial_state']
+
+    def fake_chunk_kda_bwd(**kwargs):
+        captured.update({name: kwargs.get(name) for name in ['w', 'u', 'qg', 'kg', 'v_new', 'h']})
+        q = kwargs['q']
+        k = kwargs['k']
+        v = kwargs['v']
+        beta = kwargs['beta']
+        g = kwargs['g']
+        return (
+            paddle.zeros_like(q, dtype=paddle.float32),
+            paddle.zeros_like(k, dtype=paddle.float32),
+            paddle.zeros_like(v),
+            paddle.zeros_like(beta, dtype=paddle.float32),
+            paddle.zeros_like(g, dtype=paddle.float32),
+            None,
+            None,
+            None,
+        )
+
+    monkeypatch.setattr(chunk_module, 'chunk_kda_fwd', fake_chunk_kda_fwd)
+    monkeypatch.setattr(chunk_module, 'chunk_kda_bwd', fake_chunk_kda_bwd)
+
+    q = paddle.randn([1, 8, 2, 16], dtype=paddle.float32)
+    k = paddle.randn([1, 8, 2, 16], dtype=paddle.float32)
+    v = paddle.randn([1, 8, 2, 16], dtype=paddle.float32)
+    g = paddle.randn([1, 8, 2, 16], dtype=paddle.float32)
+    beta = paddle.randn([1, 8, 2], dtype=paddle.float32)
+    A_log = paddle.randn([2], dtype=paddle.float32)
+    dt_bias = paddle.randn([32], dtype=paddle.float32)
+
+    for tensor in [q, k, v, g, beta, A_log, dt_bias]:
+        tensor.stop_gradient = False
+
+    o, _ = chunk_module.chunk_kda(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        disable_recompute=False,
+        use_qk_l2norm_in_kernel=False,
+        use_gate_in_kernel=False,
+    )
+    paddle.autograd.backward([o], [paddle.ones_like(o)])
+
+    assert captured == {'w': None, 'u': None, 'qg': None, 'kg': None, 'v_new': None, 'h': None}
 
 
 @pytest.mark.parametrize(

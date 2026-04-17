@@ -754,7 +754,7 @@ def chunk_gated_delta_rule_bwd_dhu(
         dh = paddle.empty(shape=[B, NT, HV, V, K], dtype=q.dtype)
     else:
         dh = paddle.empty(shape=[B, NT, HV, K, V], dtype=q.dtype)
-    dh0 = paddle.empty_like(h0).cast(paddle.float32) if h0 is not None else None
+    dh0 = paddle.empty_like(h0, dtype=paddle.float32) if h0 is not None else None
     dv2 = paddle.empty_like(dv)
 
     def grid(meta): return (triton.cdiv(V, meta['BV']), N*HV)

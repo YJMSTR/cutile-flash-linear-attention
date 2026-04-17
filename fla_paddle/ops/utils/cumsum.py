@@ -271,7 +271,7 @@ def chunk_local_cumsum_scalar(
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
-    g_org, g = g, paddle.empty_like(g).cast(output_dtype or g.dtype)
+    g_org, g = g, paddle.empty_like(g, dtype=output_dtype or g.dtype)
     grid = (NT, B * H)
     chunk_local_cumsum_scalar_kernel[grid](
         s=g_org,
@@ -309,7 +309,7 @@ def chunk_local_cumsum_vector(
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     assert chunk_size == 2**(chunk_size.bit_length()-1), "chunk_size must be a power of 2"
 
-    g_org, g = g, paddle.empty_like(g).cast(output_dtype or g.dtype)
+    g_org, g = g, paddle.empty_like(g, dtype=output_dtype or g.dtype)
     def grid(meta): return (triton.cdiv(meta['S'], meta['BS']), NT, B * H)
     # keep cummulative normalizer in fp32
     # this kernel is equivalent to
@@ -346,7 +346,7 @@ def chunk_global_cumsum_scalar(
         B, T, H = s.shape
     N = len(cu_seqlens) - 1 if cu_seqlens is not None else B
 
-    z = paddle.empty_like(s).cast(output_dtype or s.dtype)
+    z = paddle.empty_like(s, dtype=output_dtype or s.dtype)
     grid = (N * H,)
     chunk_global_cumsum_scalar_kernel[grid](
         s=s,
@@ -378,7 +378,7 @@ def chunk_global_cumsum_vector(
     N = len(cu_seqlens) - 1 if cu_seqlens is not None else B
     BS = min(32, triton.next_power_of_2(S))
 
-    z = paddle.empty_like(s).cast(output_dtype or s.dtype)
+    z = paddle.empty_like(s, dtype=output_dtype or s.dtype)
     grid = (triton.cdiv(S, BS), N * H)
     chunk_global_cumsum_vector_kernel[grid](
         s=s,

@@ -3,6 +3,7 @@
 
 import os
 import functools
+import inspect
 
 import paddle
 import triton
@@ -60,14 +61,48 @@ class Backend:
     DEFAULT = 102400
 
 
-def check_shared_mem(arch=None, tensor_idx=0):
-    """Check if device shared memory meets requirements."""
+def _get_device_property(props, key, default=None):
+    if isinstance(props, dict):
+        return props.get(key, default)
+    return getattr(props, key, default)
+
+
+def _infer_max_shared_mem_from_device():
+    try:
+        capability = paddle.device.cuda.get_device_capability()
+    except Exception:
+        capability = (0, 0)
+
+    try:
+        name = paddle.device.cuda.get_device_name().lower()
+    except Exception:
+        name = ''
+
+    if capability[0] >= 9:
+        return Backend.HOPPER
+    if capability[0] >= 8:
+        if any(token in name for token in ('ada', '4090', '4080', '4070', '4060', 'l40', 'l4')):
+            return Backend.ADA
+        return Backend.AMPERE
+    return 49152
+
+
+def _get_max_shared_mem():
     try:
         props = paddle.device.cuda.get_device_properties()
-        max_smem = props.get('shared_memory_per_block_optin',
-                            props.get('shared_memory_per_block', 49152))
-    except:
-        max_smem = 49152
+    except Exception:
+        props = None
+
+    for key in ('shared_memory_per_block_optin', 'shared_memory_per_block'):
+        value = _get_device_property(props, key)
+        if value is not None:
+            return value
+    return _infer_max_shared_mem_from_device()
+
+
+def check_shared_mem(arch=None, tensor_idx=0):
+    """Check if device shared memory meets requirements."""
+    max_smem = _get_max_shared_mem()
 
     if arch is None:
         return max_smem >= Backend.DEFAULT
@@ -81,12 +116,7 @@ def check_shared_mem(arch=None, tensor_idx=0):
 
 
 def get_all_max_shared_mem():
-    try:
-        props = paddle.device.cuda.get_device_properties()
-        return props.get('shared_memory_per_block_optin',
-                        props.get('shared_memory_per_block', 49152))
-    except:
-        return 49152
+    return _get_max_shared_mem()
 
 
 # ===== Triton version checks =====
@@ -159,17 +189,14 @@ def input_guard(fn=None, *, no_guard_contiguous=None):
         return functools.partial(input_guard, no_guard_contiguous=no_guard_contiguous)
 
     skip_names = set(no_guard_contiguous) if no_guard_contiguous else set()
+    try:
+        params = list(inspect.signature(fn).parameters.keys())
+    except (ValueError, TypeError):
+        params = []
 
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
         new_args = []
-        # Get parameter names for positional args
-        import inspect
-        try:
-            params = list(inspect.signature(fn).parameters.keys())
-        except (ValueError, TypeError):
-            params = []
-
         for i, arg in enumerate(args):
             param_name = params[i] if i < len(params) else ''
             if isinstance(arg, paddle.Tensor) and param_name not in skip_names:

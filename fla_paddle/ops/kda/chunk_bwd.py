@@ -5,6 +5,8 @@
 # For a list of all contributors, visit:
 #   https://github.com/fla-org/flash-linear-attention/graphs/contributors
 
+from functools import lru_cache
+
 import paddle
 import triton
 import triton.language as tl
@@ -25,6 +27,24 @@ from fla_paddle.triton_utils import enable_compat_on_triton_kernel
 
 BK_LIST = [32, 64] if check_shared_mem() else [16, 32]
 BV_LIST = [64, 128] if check_shared_mem('ampere') else [16, 32]
+
+
+@lru_cache(maxsize=None)
+def _chunk_kda_tiling(device_idx: int) -> int:
+    if check_shared_mem('hopper'):
+        return 128
+    if check_shared_mem('ada'):
+        return 64
+    return 32
+
+
+@lru_cache(maxsize=None)
+def _chunk_kda_launch_meta(device_idx: int, T: int, K: int, V: int, BT: int) -> tuple[int, int, int]:
+    const_tiling = _chunk_kda_tiling(device_idx)
+    BK = min(max(triton.next_power_of_2(K), 16), const_tiling)
+    BV = min(max(triton.next_power_of_2(V), 16), const_tiling)
+    NT = triton.cdiv(T, BT)
+    return BK, BV, NT
 NUM_WARPS = [2, 4] if IS_NVIDIA_HOPPER else [2, 4, 8]
 
 
@@ -310,16 +330,13 @@ def chunk_kda_bwd_dAv(
     BT = chunk_size
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
-    # H100 can have larger block size
-    if check_shared_mem('hopper'):
-        CONST_TILING = 128
-    elif check_shared_mem:
-        CONST_TILING = 64
+    if cu_seqlens is None:
+        BK, BV, NT = _chunk_kda_launch_meta(k.place.gpu_device_id(), T, K, V, BT)
     else:
-        CONST_TILING = 32
-    BK = min(max(triton.next_power_of_2(K), 16), CONST_TILING)
-    BV = min(max(triton.next_power_of_2(V), 16), CONST_TILING)
-    NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
+        const_tiling = _chunk_kda_tiling(k.place.gpu_device_id())
+        BK = min(max(triton.next_power_of_2(K), 16), const_tiling)
+        BV = min(max(triton.next_power_of_2(V), 16), const_tiling)
+        NT = len(chunk_indices)
 
     dA = paddle.empty([B, T, H, BT], dtype=paddle.float32)
     dv = paddle.empty_like(do)
@@ -371,12 +388,12 @@ def chunk_kda_bwd_wy_dqkg_fused(
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
 
-    dq = paddle.empty_like(q).cast(paddle.float32)
-    dk = paddle.empty_like(k).cast(paddle.float32)
+    dq = paddle.empty_like(q, dtype=paddle.float32)
+    dk = paddle.empty_like(k, dtype=paddle.float32)
     dv2 = paddle.empty_like(v)
-    dg = paddle.empty_like(g).cast(paddle.float32)
-    db = paddle.empty_like(beta).cast(paddle.float32)
-    dA = paddle.empty_like(A).cast(paddle.float32)
+    dg = paddle.empty_like(g, dtype=paddle.float32)
+    db = paddle.empty_like(beta, dtype=paddle.float32)
+    dA = paddle.empty_like(A, dtype=paddle.float32)
 
     grid = (NT, B * H)
     chunk_kda_bwd_kernel_wy_dqkg_fused[grid](

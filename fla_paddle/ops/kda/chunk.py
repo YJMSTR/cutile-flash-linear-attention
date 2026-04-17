@@ -12,6 +12,7 @@ import paddle
 from fla_paddle.modules.l2norm import l2norm_bwd, l2norm_fwd
 from fla_paddle.ops.kda.chunk_bwd import chunk_kda_bwd
 from fla_paddle.ops.kda.chunk_fwd import chunk_kda_fwd
+from fla_paddle.triton_utils import activate_paddle_driver, compat_kernel_wrapper_fastpath
 from fla_paddle.ops.utils.index import prepare_chunk_indices
 from fla_paddle.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
 
@@ -44,60 +45,59 @@ class ChunkKDAFunction(paddle.autograd.PyLayer):
         transpose_state_layout: bool = False,
     ):
         chunk_size = 64
+        with activate_paddle_driver(), compat_kernel_wrapper_fastpath():
+            _orig_forward_args = [
+                q, k, v, g, beta, A_log, dt_bias, scale, initial_state,
+                output_final_state, use_qk_l2norm_in_kernel, use_gate_in_kernel,
+                cu_seqlens, cu_seqlens_cpu, safe_gate, lower_bound,
+                disable_recompute, return_intermediate_states, cp_context, transpose_state_layout,
+            ]
 
-        # Save original input refs before any reassignment (l2norm_fwd overwrites q/k),
-        # for _tensor_mask/_needs_grad below.
-        _orig_forward_args = [
-            q, k, v, g, beta, A_log, dt_bias, scale, initial_state,
-            output_final_state, use_qk_l2norm_in_kernel, use_gate_in_kernel,
-            cu_seqlens, cu_seqlens_cpu, safe_gate, lower_bound,
-            disable_recompute, return_intermediate_states, cp_context, transpose_state_layout,
-        ]
+            q_rstd, k_rstd = None, None
+            if use_qk_l2norm_in_kernel:
+                q, q_rstd = l2norm_fwd(q)
+                k, k_rstd = l2norm_fwd(k)
 
-        # Apply l2norm
-        q_rstd, k_rstd = None, None
-        if use_qk_l2norm_in_kernel:
-            q, q_rstd = l2norm_fwd(q)
-            k, k_rstd = l2norm_fwd(k)
+            chunk_indices = prepare_chunk_indices(
+                cu_seqlens, chunk_size, cu_seqlens_cpu=cu_seqlens_cpu) if cu_seqlens is not None else None
 
-        chunk_indices = prepare_chunk_indices(
-            cu_seqlens, chunk_size, cu_seqlens_cpu=cu_seqlens_cpu) if cu_seqlens is not None else None
+            g_input = g
 
-        g_input = g
+            (o, final_state, g_cumsum, Aqk, Akk, w, u, qg, kg, v_new, h, initial_state) = chunk_kda_fwd(
+                q=q,
+                k=k,
+                v=v,
+                g=g_input,
+                beta=beta,
+                scale=scale,
+                initial_state=initial_state,
+                output_final_state=output_final_state,
+                cu_seqlens=cu_seqlens,
+                cu_seqlens_cpu=cu_seqlens_cpu,
+                chunk_indices=chunk_indices,
+                safe_gate=safe_gate,
+                lower_bound=lower_bound,
+                use_gate_in_kernel=use_gate_in_kernel,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                disable_recompute=disable_recompute,
+                return_intermediate_states=return_intermediate_states,
+                cp_context=cp_context,
+                transpose_state_layout=transpose_state_layout,
+            )
 
-        (o, final_state, g_cumsum, Aqk, Akk, w, u, qg, kg, v_new, h, initial_state) = chunk_kda_fwd(
-            q=q,
-            k=k,
-            v=v,
-            g=g_input,
-            beta=beta,
-            scale=scale,
-            initial_state=initial_state,
-            output_final_state=output_final_state,
-            cu_seqlens=cu_seqlens,
-            cu_seqlens_cpu=cu_seqlens_cpu,
-            chunk_indices=chunk_indices,
-            safe_gate=safe_gate,
-            lower_bound=lower_bound,
-            use_gate_in_kernel=use_gate_in_kernel,
-            A_log=A_log,
-            dt_bias=dt_bias,
-            disable_recompute=disable_recompute,
-            return_intermediate_states=return_intermediate_states,
-            cp_context=cp_context,
-            transpose_state_layout=transpose_state_layout,
-        )
+            if return_intermediate_states:
+                assert not paddle.is_grad_enabled(), "return_intermediate_states is only allowed in inference mode"
+                assert disable_recompute is False, "return_intermediate_states must be used with disable_recompute=False"
+                return o.cast(q.dtype), final_state, h
 
-        if return_intermediate_states:
-            assert not paddle.is_grad_enabled(), "return_intermediate_states is only allowed in inference mode"
-            assert disable_recompute is False, "return_intermediate_states must be used with disable_recompute=False"
-            return o.cast(q.dtype), final_state, h
-
-        ctx.save_for_backward(
-            q, q_rstd, k, k_rstd, v, g_cumsum, g_input, beta, A_log, dt_bias, Aqk, Akk,
-            w, u, qg, kg, v_new, h,
-            initial_state, cu_seqlens, chunk_indices
-        )
+            saved_tensors = [
+                q, q_rstd, k, k_rstd, v, g_cumsum, g_input, beta, A_log, dt_bias, Aqk, Akk,
+                initial_state, cu_seqlens, chunk_indices,
+            ]
+            if disable_recompute:
+                saved_tensors.extend([w, u, qg, kg, v_new, h])
+            ctx.save_for_backward(*saved_tensors)
         ctx.chunk_size = chunk_size
         ctx.safe_gate = safe_gate
         ctx.scale = scale
@@ -130,39 +130,44 @@ class ChunkKDAFunction(paddle.autograd.PyLayer):
         # restore dht to None so downstream bwd functions handle it correctly
         if not ctx.output_final_state:
             dht = None
-        (q, q_rstd, k, k_rstd, v, g_cumsum, g_input, beta, A_log, dt_bias, Aqk, Akk,
-         w, u, qg, kg, v_new, h,
-         initial_state, cu_seqlens, chunk_indices) = (
-            ctx.saved_tensor()
-        )
+        with activate_paddle_driver(), compat_kernel_wrapper_fastpath():
+            saved_tensors = ctx.saved_tensor()
+            if ctx.disable_recompute:
+                (q, q_rstd, k, k_rstd, v, g_cumsum, g_input, beta, A_log, dt_bias, Aqk, Akk,
+                 initial_state, cu_seqlens, chunk_indices,
+                 w, u, qg, kg, v_new, h) = saved_tensors
+            else:
+                (q, q_rstd, k, k_rstd, v, g_cumsum, g_input, beta, A_log, dt_bias, Aqk, Akk,
+                 initial_state, cu_seqlens, chunk_indices) = saved_tensors
+                w = u = qg = kg = v_new = h = None
 
-        dq, dk, dv, db, dg, dh0, dA, dbias = chunk_kda_bwd(
-            q=q,
-            k=k,
-            v=v,
-            g=g_cumsum,
-            beta=beta,
-            Aqk=Aqk,
-            Akk=Akk,
-            scale=ctx.scale,
-            initial_state=initial_state,
-            do=do,
-            dht=dht,
-            cu_seqlens=cu_seqlens,
-            chunk_indices=chunk_indices,
-            chunk_size=ctx.chunk_size,
-            safe_gate=ctx.safe_gate,
-            g_org=g_input if ctx.use_gate_in_kernel else None, lower_bound=ctx.lower_bound,
-            use_gate_in_kernel=ctx.use_gate_in_kernel,
-            A_log=A_log, dt_bias=dt_bias,
-            disable_recompute=ctx.disable_recompute,
-            w=w, u=u, qg=qg, kg=kg, v_new=v_new, h=h,
-            cp_context=ctx.cp_context,
-            transpose_state_layout=ctx.transpose_state_layout,
-        )
-        if ctx.use_qk_l2norm_in_kernel:
-            dq = l2norm_bwd(q, q_rstd, dq)
-            dk = l2norm_bwd(k, k_rstd, dk)
+            dq, dk, dv, db, dg, dh0, dA, dbias = chunk_kda_bwd(
+                q=q,
+                k=k,
+                v=v,
+                g=g_cumsum,
+                beta=beta,
+                Aqk=Aqk,
+                Akk=Akk,
+                scale=ctx.scale,
+                initial_state=initial_state,
+                do=do,
+                dht=dht,
+                cu_seqlens=cu_seqlens,
+                chunk_indices=chunk_indices,
+                chunk_size=ctx.chunk_size,
+                safe_gate=ctx.safe_gate,
+                g_org=g_input if ctx.use_gate_in_kernel else None, lower_bound=ctx.lower_bound,
+                use_gate_in_kernel=ctx.use_gate_in_kernel,
+                A_log=A_log, dt_bias=dt_bias,
+                disable_recompute=ctx.disable_recompute,
+                w=w, u=u, qg=qg, kg=kg, v_new=v_new, h=h,
+                cp_context=ctx.cp_context,
+                transpose_state_layout=ctx.transpose_state_layout,
+            )
+            if ctx.use_qk_l2norm_in_kernel:
+                dq = l2norm_bwd(q, q_rstd, dq)
+                dk = l2norm_bwd(k, k_rstd, dk)
 
         # Build all grads in forward arg order, filter to tensor inputs only.
         # Order: q, k, v, g, beta, A_log, dt_bias, scale, initial_state,

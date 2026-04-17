@@ -9,11 +9,376 @@ import paddle.nn.functional as F
 import pytest
 from einops import repeat
 
+import fla_paddle.ops.common.chunk_delta_h as chunk_delta_h_module
+import fla_paddle.ops.common.chunk_o as chunk_o_module
+import fla_paddle.ops.gated_delta_rule.chunk as chunk_module
+import fla_paddle.ops.gated_delta_rule.chunk_fwd as chunk_fwd_module
 from fla_paddle.ops.gated_delta_rule import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
 from fla_paddle.ops.gated_delta_rule.gate import fused_gdn_gate, naive_gdn_gate
 from fla_paddle.ops.gated_delta_rule.naive import naive_recurrent_gated_delta_rule
 
 from .conftest import assert_close
+
+
+def test_chunk_gdn_bwd_dhu_allocates_dh0_with_dtype(monkeypatch):
+    recorded = {'h0_dtype': None}
+    real_empty_like = chunk_delta_h_module.paddle.empty_like
+
+    def fake_empty_like(x, dtype=None, **kwargs):
+        if x is h0:
+            recorded['h0_dtype'] = dtype
+        return real_empty_like(x, dtype=dtype, **kwargs)
+
+    class FakeKernel:
+        def __getitem__(self, grid):
+            def launch(**kwargs):
+                return None
+
+            return launch
+
+    monkeypatch.setattr(chunk_delta_h_module.paddle, 'empty_like', fake_empty_like)
+    monkeypatch.setattr(chunk_delta_h_module, 'chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64', FakeKernel())
+
+    q = paddle.randn([1, 64, 2, 8], dtype=paddle.float32)
+    k = paddle.randn([1, 64, 2, 8], dtype=paddle.float32)
+    w = paddle.randn([1, 64, 2, 8], dtype=paddle.float32)
+    dv = paddle.randn([1, 64, 2, 8], dtype=paddle.float32)
+    do = paddle.randn([1, 64, 2, 8], dtype=paddle.float32)
+    h0 = paddle.randn([1, 2, 8, 8], dtype=paddle.float32)
+
+    chunk_delta_h_module.chunk_gated_delta_rule_bwd_dhu(
+        q=q,
+        k=k,
+        w=w,
+        dv=dv,
+        do=do,
+        h0=h0,
+        scale=1.0,
+    )
+
+    assert recorded['h0_dtype'] == paddle.float32
+
+
+def test_chunk_gdn_fwd_intra_allocates_A_with_zeros(monkeypatch):
+    recorded = {'shape': None, 'dtype': None}
+    real_zeros = chunk_fwd_module.paddle.zeros
+
+    def fake_zeros(shape=None, dtype=None, **kwargs):
+        recorded['shape'] = list(shape)
+        recorded['dtype'] = dtype
+        return real_zeros(shape=shape, dtype=dtype, **kwargs)
+
+    class FakeKernel:
+        def __getitem__(self, grid):
+            def launch(**kwargs):
+                return None
+
+            return launch
+
+    def fake_recompute_w_u_fwd(**kwargs):
+        k = kwargs['k']
+        v = kwargs['v']
+        return paddle.zeros_like(k), paddle.zeros_like(v)
+
+    monkeypatch.setattr(chunk_fwd_module.paddle, 'zeros', fake_zeros)
+    monkeypatch.setattr(chunk_fwd_module, 'chunk_gated_delta_rule_fwd_kkt_solve_kernel', FakeKernel())
+    monkeypatch.setattr(chunk_fwd_module, 'recompute_w_u_fwd', fake_recompute_w_u_fwd)
+
+    k = paddle.randn([2, 64, 3, 16], dtype=paddle.float32)
+    v = paddle.randn([2, 64, 3, 16], dtype=paddle.float32)
+    g = paddle.randn([2, 64, 3], dtype=paddle.float32)
+    beta = paddle.randn([2, 64, 3], dtype=paddle.float32)
+
+    _, _, A = chunk_fwd_module.chunk_gated_delta_rule_fwd_intra(
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+    )
+
+    assert A.shape == [2, 64, 3, 64]
+    assert recorded['shape'] == [2, 64, 3, 64]
+    assert recorded['dtype'] == k.dtype
+
+
+def test_chunk_gdn_bwd_dqkwg_uses_compact_dg_buffer_when_nk_is_one(monkeypatch):
+    captured = {'shape': None}
+
+    class FakeKernel:
+        def __getitem__(self, grid):
+            def launch(**kwargs):
+                dg = kwargs.get('dg')
+                if dg is not None:
+                    captured['shape'] = list(dg.shape)
+                return None
+
+            return launch
+
+    monkeypatch.setattr(chunk_o_module, 'chunk_bwd_kernel_dqkwg', FakeKernel())
+    monkeypatch.setattr(chunk_o_module, 'check_shared_mem', lambda arch=None, *args, **kwargs: arch == 'hopper')
+
+    q = paddle.randn([2, 64, 2, 64], dtype=paddle.float32)
+    k = paddle.randn([2, 64, 2, 64], dtype=paddle.float32)
+    v = paddle.randn([2, 64, 2, 64], dtype=paddle.float32)
+    do = paddle.randn([2, 64, 2, 64], dtype=paddle.float32)
+    h = paddle.randn([2, 1, 2, 64, 64], dtype=paddle.float32)
+    dh = paddle.randn([2, 1, 2, 64, 64], dtype=paddle.float32)
+    w = paddle.randn([2, 64, 2, 64], dtype=paddle.float32)
+    g = paddle.randn([2, 64, 2], dtype=paddle.float32)
+    dv = paddle.randn([2, 64, 2, 64], dtype=paddle.float32)
+
+    _, _, _, dg = chunk_o_module.chunk_bwd_dqkwg(
+        q=q,
+        k=k,
+        v=v,
+        do=do,
+        h=h,
+        dh=dh,
+        w=w,
+        g=g,
+        dv=dv,
+        scale=1.0,
+        use_exp2=True,
+    )
+
+    assert captured['shape'] == list(g.shape)
+    assert list(dg.shape) == list(g.shape)
+
+
+def test_chunk_gdn_chunk_o_caches_const_tiling_per_device(monkeypatch):
+    calls = {'count': 0}
+
+    class FakeKernel:
+        def __getitem__(self, grid):
+            def launch(**kwargs):
+                return None
+
+            return launch
+
+    def fake_check_shared_mem(arch=None, *args, **kwargs):
+        calls['count'] += 1
+        return arch == 'hopper'
+
+    chunk_o_module._const_tiling.cache_clear()
+    chunk_o_module._chunk_o_launch_meta.cache_clear()
+    monkeypatch.setattr(chunk_o_module, 'chunk_bwd_kernel_dv_local', FakeKernel())
+    monkeypatch.setattr(chunk_o_module, 'chunk_bwd_kernel_dqkwg', FakeKernel())
+    monkeypatch.setattr(chunk_o_module, 'check_shared_mem', fake_check_shared_mem)
+
+    q = paddle.randn([2, 64, 2, 64], dtype=paddle.float32)
+    k = paddle.randn([2, 64, 2, 64], dtype=paddle.float32)
+    v = paddle.randn([2, 64, 2, 64], dtype=paddle.float32)
+    do = paddle.randn([2, 64, 2, 64], dtype=paddle.float32)
+    h = paddle.randn([2, 1, 2, 64, 64], dtype=paddle.float32)
+    dh = paddle.randn([2, 1, 2, 64, 64], dtype=paddle.float32)
+    w = paddle.randn([2, 64, 2, 64], dtype=paddle.float32)
+    g = paddle.randn([2, 64, 2], dtype=paddle.float32)
+    dv = paddle.randn([2, 64, 2, 64], dtype=paddle.float32)
+
+    chunk_o_module.chunk_bwd_dv_local(q=q, k=k, do=do, g=g, scale=1.0, use_exp2=True)
+    chunk_o_module.chunk_bwd_dv_local(q=q, k=k, do=do, g=g, scale=1.0, use_exp2=True)
+
+    assert calls['count'] == 1
+    chunk_o_module._const_tiling.cache_clear()
+    chunk_o_module._chunk_o_launch_meta.cache_clear()
+
+
+def test_chunk_gdn_forward_enters_driver_fastpath_scope(monkeypatch):
+    calls = {'driver': 0, 'fastpath': 0}
+
+    class Ctx:
+        def __init__(self, key):
+            self.key = key
+
+        def __enter__(self):
+            calls[self.key] += 1
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    def fake_chunk_gdn_fwd(**kwargs):
+        q = kwargs['q']
+        v = kwargs['v']
+        g = kwargs['g']
+        B, T, H, K = q.shape
+        V = v.shape[-1]
+        o = paddle.zeros_like(v)
+        A = paddle.zeros([B, T, H, 64], dtype=q.dtype)
+        if kwargs.get('return_intermediates'):
+            w = paddle.zeros([B, T, H, K], dtype=q.dtype)
+            u = paddle.zeros_like(v)
+            h = paddle.zeros([B, T // 64, H, K, V], dtype=paddle.float32)
+            v_new = paddle.zeros_like(v)
+            return g, o, A, None, kwargs['initial_state'], None, w, u, h, v_new
+        return g, o, A, None, kwargs['initial_state'], None
+
+    monkeypatch.setattr(chunk_module, 'activate_paddle_driver', lambda: Ctx('driver'))
+    monkeypatch.setattr(chunk_module, 'compat_kernel_wrapper_fastpath', lambda: Ctx('fastpath'))
+    monkeypatch.setattr(chunk_module, 'chunk_gated_delta_rule_fwd', fake_chunk_gdn_fwd)
+
+    q = paddle.randn([1, 64, 2, 8], dtype=paddle.float32)
+    k = paddle.randn([1, 64, 2, 8], dtype=paddle.float32)
+    v = paddle.randn([1, 64, 2, 8], dtype=paddle.float32)
+    g = paddle.randn([1, 64, 2], dtype=paddle.float32)
+    beta = paddle.randn([1, 64, 2], dtype=paddle.float32)
+
+    for tensor in [q, k, v, g, beta]:
+        tensor.stop_gradient = False
+
+    chunk_module.chunk_gated_delta_rule(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        use_qk_l2norm_in_kernel=False,
+        output_final_state=False,
+    )
+
+    assert calls == {'driver': 1, 'fastpath': 1}
+
+
+def test_chunk_gdn_backward_skips_recompute_by_default_for_equal_length_training(monkeypatch):
+    calls = {'recompute': 0}
+
+    def fake_chunk_gdn_fwd(**kwargs):
+        q = kwargs['q']
+        v = kwargs['v']
+        g = kwargs['g']
+        B, T, H, K = q.shape
+        V = v.shape[-1]
+        o = paddle.zeros_like(v)
+        A = paddle.zeros([B, T, H, 64], dtype=q.dtype)
+        w = paddle.ones([B, T, H, K], dtype=q.dtype)
+        u = paddle.ones([B, T, H, V], dtype=v.dtype)
+        h = paddle.ones([B, T // 64, H, K, V], dtype=paddle.float32)
+        v_new = paddle.ones([B, T, H, V], dtype=v.dtype)
+        if kwargs.get('return_intermediates'):
+            return g, o, A, None, kwargs['initial_state'], g, w, u, h, v_new
+        return g, o, A, None, kwargs['initial_state'], g
+
+    def fake_recompute_w_u_fwd(**kwargs):
+        calls['recompute'] += 1
+        return paddle.zeros_like(kwargs['k']), paddle.zeros_like(kwargs['v'])
+
+    monkeypatch.setattr(chunk_module, 'chunk_gated_delta_rule_fwd', fake_chunk_gdn_fwd)
+    monkeypatch.setattr(chunk_module, 'recompute_w_u_fwd', fake_recompute_w_u_fwd)
+    monkeypatch.setattr(chunk_module, 'chunk_bwd_dv_local', lambda **kwargs: paddle.zeros_like(kwargs['do']))
+    monkeypatch.setattr(
+        chunk_module,
+        'chunk_gated_delta_rule_bwd_dhu',
+        lambda **kwargs: (
+            paddle.zeros_like(kwargs['w'], dtype=paddle.float32),
+            paddle.zeros_like(kwargs['h0']),
+            kwargs['dv'],
+        ),
+    )
+    monkeypatch.setattr(
+        chunk_module,
+        'chunk_bwd_dqkwg',
+        lambda **kwargs: (
+            paddle.zeros_like(kwargs['q'], dtype=paddle.float32),
+            paddle.zeros_like(kwargs['k'], dtype=paddle.float32),
+            paddle.zeros_like(kwargs['w'], dtype=paddle.float32),
+            paddle.zeros_like(kwargs['g'], dtype=paddle.float32),
+        ),
+    )
+    monkeypatch.setattr(
+        chunk_module,
+        'prepare_wy_repr_bwd',
+        lambda **kwargs: (
+            paddle.zeros_like(kwargs['k'], dtype=paddle.float32),
+            paddle.zeros_like(kwargs['v']),
+            paddle.zeros_like(kwargs['beta'], dtype=paddle.float32),
+            paddle.zeros_like(kwargs['g'], dtype=paddle.float32),
+        ),
+    )
+
+    q = paddle.randn([1, 64, 2, 8], dtype=paddle.float32)
+    k = paddle.randn([1, 64, 2, 8], dtype=paddle.float32)
+    v = paddle.randn([1, 64, 2, 8], dtype=paddle.float32)
+    g = paddle.randn([1, 64, 2], dtype=paddle.float32)
+    beta = paddle.randn([1, 64, 2], dtype=paddle.float32)
+    initial_state = paddle.zeros([1, 2, 8, 8], dtype=paddle.float32)
+    for tensor in [q, k, v, g, beta, initial_state]:
+        tensor.stop_gradient = False
+
+    o, _ = chunk_module.chunk_gated_delta_rule(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        initial_state=initial_state,
+        use_qk_l2norm_in_kernel=False,
+        output_final_state=False,
+    )
+    paddle.autograd.backward([o], [paddle.ones_like(o)])
+
+    assert calls['recompute'] == 0
+
+
+def test_chunk_gdn_backward_keeps_recompute_when_output_final_state_requested(monkeypatch):
+    calls = {'recompute': 0}
+
+    def fake_recompute_w_u_fwd(**kwargs):
+        calls['recompute'] += 1
+        return paddle.zeros_like(kwargs['k']), paddle.zeros_like(kwargs['v'])
+
+    monkeypatch.setattr(chunk_module, 'recompute_w_u_fwd', fake_recompute_w_u_fwd)
+    monkeypatch.setattr(chunk_module, 'chunk_bwd_dv_local', lambda **kwargs: paddle.zeros_like(kwargs['do']))
+    monkeypatch.setattr(
+        chunk_module,
+        'chunk_gated_delta_rule_bwd_dhu',
+        lambda **kwargs: (
+            paddle.zeros_like(kwargs['w'], dtype=paddle.float32),
+            paddle.zeros_like(kwargs['h0']),
+            kwargs['dv'],
+        ),
+    )
+    monkeypatch.setattr(
+        chunk_module,
+        'chunk_bwd_dqkwg',
+        lambda **kwargs: (
+            paddle.zeros_like(kwargs['q'], dtype=paddle.float32),
+            paddle.zeros_like(kwargs['k'], dtype=paddle.float32),
+            paddle.zeros_like(kwargs['w'], dtype=paddle.float32),
+            paddle.zeros_like(kwargs['g'], dtype=paddle.float32),
+        ),
+    )
+    monkeypatch.setattr(
+        chunk_module,
+        'prepare_wy_repr_bwd',
+        lambda **kwargs: (
+            paddle.zeros_like(kwargs['k'], dtype=paddle.float32),
+            paddle.zeros_like(kwargs['v']),
+            paddle.zeros_like(kwargs['beta'], dtype=paddle.float32),
+            paddle.zeros_like(kwargs['g'], dtype=paddle.float32),
+        ),
+    )
+
+    q = paddle.randn([1, 64, 2, 8], dtype=paddle.float32)
+    k = paddle.randn([1, 64, 2, 8], dtype=paddle.float32)
+    v = paddle.randn([1, 64, 2, 8], dtype=paddle.float32)
+    g = paddle.randn([1, 64, 2], dtype=paddle.float32)
+    beta = paddle.randn([1, 64, 2], dtype=paddle.float32)
+    initial_state = paddle.zeros([1, 2, 8, 8], dtype=paddle.float32)
+    for tensor in [q, k, v, g, beta, initial_state]:
+        tensor.stop_gradient = False
+
+    o, ht = chunk_module.chunk_gated_delta_rule(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        initial_state=initial_state,
+        use_qk_l2norm_in_kernel=False,
+        output_final_state=True,
+    )
+    paddle.autograd.backward([o, ht], [paddle.ones_like(o), paddle.ones_like(ht)])
+
+    assert calls['recompute'] == 1
 
 
 @pytest.mark.parametrize(

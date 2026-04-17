@@ -5,6 +5,8 @@
 # For a list of all contributors, visit:
 #   https://github.com/fla-org/flash-linear-attention/graphs/contributors
 
+from functools import lru_cache
+
 import paddle
 import triton
 import triton.language as tl
@@ -16,6 +18,25 @@ from fla_paddle.triton_utils import enable_compat_on_triton_kernel
 
 BKV_LIST = [64, 128] if check_shared_mem() else ([32, 64] if check_shared_mem('ada') else [32])
 NUM_WARPS = [2, 4] if IS_NVIDIA_HOPPER else [2, 4, 8]
+
+
+@lru_cache(maxsize=None)
+def _const_tiling(device_idx: int) -> int:
+    if check_shared_mem('hopper', device_idx):
+        return 128
+    if check_shared_mem('ada', device_idx):
+        return 64
+    return 32
+
+
+@lru_cache(maxsize=None)
+def _chunk_o_launch_meta(device_idx: int, T: int, K: int, V: int, BT: int) -> tuple[int, int, int, int]:
+    const_tiling = _const_tiling(device_idx)
+    BK = min(max(triton.next_power_of_2(K), 16), const_tiling)
+    BV = min(max(triton.next_power_of_2(V), 16), const_tiling)
+    NT = triton.cdiv(T, BT)
+    NK = triton.cdiv(K, BK)
+    return BK, BV, NT, NK
 
 
 @enable_compat_on_triton_kernel
@@ -606,13 +627,7 @@ def chunk_bwd_dv(
     BT = chunk_size
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
-    # H100 can have larger block size
-    if check_shared_mem('hopper', k.place.gpu_device_id()):
-        CONST_TILING = 128
-    elif check_shared_mem('ada', k.place.gpu_device_id()):
-        CONST_TILING = 64
-    else:
-        CONST_TILING = 32
+    CONST_TILING = _const_tiling(k.place.gpu_device_id())
     BK = min(max(triton.next_power_of_2(K), 16), CONST_TILING)
     BV = min(max(triton.next_power_of_2(V), 16), CONST_TILING)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
@@ -663,16 +678,13 @@ def chunk_bwd_dv_local(
     BT = chunk_size
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
-    # H100 can have larger block size
-    if check_shared_mem('hopper', k.place.gpu_device_id()):
-        CONST_TILING = 128
-    elif check_shared_mem('ada', k.place.gpu_device_id()):
-        CONST_TILING = 64
+    if cu_seqlens is None:
+        BK, BV, NT, _ = _chunk_o_launch_meta(k.place.gpu_device_id(), T, K, V, BT)
     else:
-        CONST_TILING = 32
-    BK = min(max(triton.next_power_of_2(K), 16), CONST_TILING)
-    BV = min(max(triton.next_power_of_2(V), 16), CONST_TILING)
-    NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
+        const_tiling = _const_tiling(k.place.gpu_device_id())
+        BK = min(max(triton.next_power_of_2(K), 16), const_tiling)
+        BV = min(max(triton.next_power_of_2(V), 16), const_tiling)
+        NT = len(chunk_indices)
 
     dv = paddle.empty_like(do)
     grid = (NT, B * HV)
@@ -723,20 +735,24 @@ def chunk_bwd_dqkwg(
     BT = chunk_size
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
-    NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
-
-    if check_shared_mem('hopper', k.place.gpu_device_id()):
-        CONST_TILING = 128
-    elif check_shared_mem('ada', k.place.gpu_device_id()):
-        CONST_TILING = 64
+    if cu_seqlens is None:
+        BK, BV, NT, NK = _chunk_o_launch_meta(k.place.gpu_device_id(), T, K, V, BT)
     else:
-        CONST_TILING = 32
-    BK = min(max(triton.next_power_of_2(K), 16), CONST_TILING)
-    BV = min(max(triton.next_power_of_2(V), 16), CONST_TILING)
-    NK = triton.cdiv(K, BK)
+        NT = len(chunk_indices)
+        const_tiling = _const_tiling(k.place.gpu_device_id())
+        BK = min(max(triton.next_power_of_2(K), 16), const_tiling)
+        BV = min(max(triton.next_power_of_2(V), 16), const_tiling)
+        NK = triton.cdiv(K, BK)
     dq = paddle.empty(shape=[B, T, HV, K], dtype=q.dtype)
     dk = paddle.empty(shape=[B, T, HV, K], dtype=k.dtype)
-    dg = paddle.empty(shape=[NK, *g.shape], dtype=paddle.float32) if g is not None else None
+    dg = None
+    reduce_dg = False
+    if g is not None:
+        if NK == 1:
+            dg = paddle.empty(shape=list(g.shape), dtype=paddle.float32)
+        else:
+            dg = paddle.empty(shape=[NK, *g.shape], dtype=paddle.float32)
+            reduce_dg = True
     dw = paddle.empty_like(w) if w is not None else None
 
     grid = (NK, NT, B * HV)
@@ -773,6 +789,6 @@ def chunk_bwd_dqkwg(
     if H != HV:
         dq = dq.reshape([B, T, H, HV // H, K]).sum(axis=3)
         dk = dk.reshape([B, T, H, HV // H, K]).sum(axis=3)
-    if dg is not None:
+    if dg is not None and reduce_dg:
         dg = dg.sum(axis=0)
     return dq, dk, dw, dg

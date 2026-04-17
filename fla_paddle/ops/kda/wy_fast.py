@@ -5,6 +5,8 @@
 # For a list of all contributors, visit:
 #   https://github.com/fla-org/flash-linear-attention/graphs/contributors
 
+from functools import lru_cache
+
 import paddle
 import triton
 import triton.language as tl
@@ -279,16 +281,19 @@ def prepare_wy_repr_bwd(
     BT = 64
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
-    NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
-    CONST_TILING = 64 if check_shared_mem() else 32
-    BK = min(max(triton.next_power_of_2(K), 16), CONST_TILING)
-    BV = min(max(triton.next_power_of_2(V), 16), CONST_TILING)
+    if cu_seqlens is None:
+        BK, BV, NT = _wy_launch_meta(k.place.gpu_device_id(), T, K, V, BT)
+    else:
+        const_tiling = _wy_tiling(k.place.gpu_device_id())
+        BK = min(max(triton.next_power_of_2(K), 16), const_tiling)
+        BV = min(max(triton.next_power_of_2(V), 16), const_tiling)
+        NT = len(chunk_indices)
 
-    dk2 = paddle.empty_like(dk).cast(paddle.float32)
+    dk2 = paddle.empty_like(dk, dtype=paddle.float32)
     dv = paddle.empty_like(v)
-    dg2 = paddle.empty_like(gk).cast(paddle.float32)
-    dA = paddle.empty_like(A).cast(paddle.float32)
-    db = paddle.empty_like(beta).cast(paddle.float32)
+    dg2 = paddle.empty_like(gk, dtype=paddle.float32)
+    dA = paddle.empty_like(A, dtype=paddle.float32)
+    db = paddle.empty_like(beta, dtype=paddle.float32)
     prepare_wy_repr_bwd_kda_kernel[(NT, B * H)](
         k=k,
         v=v,
@@ -317,3 +322,16 @@ def prepare_wy_repr_bwd(
     dk = dk2
     dg = dg2
     return dk, dv, db, dg, dA
+@lru_cache(maxsize=None)
+def _wy_tiling(device_idx: int) -> int:
+    return 64 if check_shared_mem() else 32
+
+
+@lru_cache(maxsize=None)
+def _wy_launch_meta(device_idx: int, T: int, K: int, V: int, BT: int) -> tuple[int, int, int]:
+    const_tiling = _wy_tiling(device_idx)
+    BK = min(max(triton.next_power_of_2(K), 16), const_tiling)
+    BV = min(max(triton.next_power_of_2(V), 16), const_tiling)
+    NT = triton.cdiv(T, BT)
+    return BK, BV, NT
+

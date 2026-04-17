@@ -3,6 +3,8 @@
 # Adapted for PaddlePaddle
 
 import os
+from contextlib import contextmanager
+
 import paddle
 from functools import cache
 from importlib.metadata import PackageNotFoundError, distribution
@@ -32,6 +34,7 @@ if _is_package_installed("torch"):
 # ---------------------------------------------------------------------------
 _driver_probe_enabled: bool = False
 _driver_probe_result: str = "not_probed"
+_compat_wrapper_fastpath_depth: int = 0
 
 
 def enable_driver_probe():
@@ -82,11 +85,24 @@ def _probe_active_driver():
         _driver_probe_result = f'error({e})'
 
 
+def _wrap_probe_only(fn):
+    def wrapped_fn(*args, **kwargs):
+        if _driver_probe_enabled:
+            _probe_active_driver()
+        return fn(*args, **kwargs)
+
+    return wrapped_fn
+
+
 def swap_driver_guard(fn):
     """Temporarily swap triton's active driver to Paddle driver."""
     from triton.runtime.driver import driver
 
     def wrapped_fn(*args, **kwargs):
+        if paddle_driver is None or driver.active is paddle_driver:
+            if _driver_probe_enabled:
+                _probe_active_driver()
+            return fn(*args, **kwargs)
         driver.set_active(paddle_driver)
         try:
             if _driver_probe_enabled:
@@ -96,6 +112,47 @@ def swap_driver_guard(fn):
             driver.reset_active()
 
     return wrapped_fn
+
+
+def _should_bypass_compat_kernel_wrapper() -> bool:
+    if _compat_wrapper_fastpath_depth <= 0 or paddle_driver is None:
+        return False
+    try:
+        from triton.runtime.driver import driver
+    except Exception:
+        return False
+    return driver.active is paddle_driver
+
+
+@contextmanager
+def compat_kernel_wrapper_fastpath():
+    """Allow compat-wrapped kernels to skip re-wrapping when Paddle driver is already active."""
+    global _compat_wrapper_fastpath_depth
+    _compat_wrapper_fastpath_depth += 1
+    try:
+        yield
+    finally:
+        _compat_wrapper_fastpath_depth -= 1
+
+
+@contextmanager
+def activate_paddle_driver():
+    """Activate the Paddle Triton driver for a wider Python region when available."""
+    if paddle_driver is None:
+        yield
+        return
+
+    from triton.runtime.driver import driver
+
+    if driver.active is paddle_driver:
+        yield
+        return
+
+    driver.set_active(paddle_driver)
+    try:
+        yield
+    finally:
+        driver.reset_active()
 
 
 def enable_compat_on_triton_kernel(triton_kernel):
@@ -120,6 +177,11 @@ def enable_compat_on_triton_kernel(triton_kernel):
             self.kernel = kernel
 
         def __getitem__(self, index):
+            if _should_bypass_compat_kernel_wrapper():
+                launcher = self.kernel[index]
+                if _driver_probe_enabled:
+                    return _wrap_probe_only(launcher)
+                return launcher
             return swap_driver_guard(self.kernel[index])
 
         def __getattr__(self, name):

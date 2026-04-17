@@ -19,6 +19,15 @@ from fla_paddle.ops.utils import chunk_local_cumsum
 from fla_paddle.ops.utils.constant import RCP_LN2
 from fla_paddle.ops.utils.index import prepare_chunk_indices
 from fla_paddle.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
+from fla_paddle.triton_utils import activate_paddle_driver, compat_kernel_wrapper_fastpath
+
+
+def _use_saved_intermediates_no_recompute(
+    output_final_state: bool,
+    cu_seqlens: paddle.Tensor | None,
+    cp_context,
+) -> bool:
+    return not output_final_state and cu_seqlens is None and cp_context is None
 
 
 def chunk_gated_delta_rule_fwd(
@@ -38,6 +47,7 @@ def chunk_gated_delta_rule_fwd(
     use_gate_in_kernel: bool = False,
     A_log: paddle.Tensor | None = None,
     dt_bias: paddle.Tensor | None = None,
+    return_intermediates: bool = False,
 ):
     g_input = g if use_gate_in_kernel else None
     if use_gate_in_kernel:
@@ -97,6 +107,8 @@ def chunk_gated_delta_rule_fwd(
         use_exp2=use_exp2,
         transpose_state_layout=transpose_state_layout,
     )
+    if return_intermediates:
+        return g, o, A, final_state, initial_state, g_input, w, u, h, v_new
     return g, o, A, final_state, initial_state, g_input
 
 
@@ -120,32 +132,39 @@ def chunk_gated_delta_rule_bwd(
     g_input: paddle.Tensor | None = None,
     A_log: paddle.Tensor | None = None,
     dt_bias: paddle.Tensor | None = None,
+    saved_w: paddle.Tensor | None = None,
+    saved_u: paddle.Tensor | None = None,
+    saved_h: paddle.Tensor | None = None,
+    saved_v_new: paddle.Tensor | None = None,
 ):
-    w, u = recompute_w_u_fwd(
-        k=k,
-        v=v,
-        beta=beta,
-        A=A,
-        g=g,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-        use_exp2=use_exp2,
-    )
+    if all(t is not None for t in (saved_w, saved_u, saved_h, saved_v_new)):
+        w, u, h, v_new = saved_w, saved_u, saved_h, saved_v_new
+    else:
+        w, u = recompute_w_u_fwd(
+            k=k,
+            v=v,
+            beta=beta,
+            A=A,
+            g=g,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            use_exp2=use_exp2,
+        )
 
-    # CP (Context Parallel) is skipped in Phase 1
+        # CP (Context Parallel) is skipped in Phase 1
 
-    h, v_new, _ = chunk_gated_delta_rule_fwd_h(
-        k=k,
-        w=w,
-        u=u,
-        g=g,
-        initial_state=initial_state,
-        output_final_state=False,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-        use_exp2=use_exp2,
-        transpose_state_layout=transpose_state_layout,
-    )
+        h, v_new, _ = chunk_gated_delta_rule_fwd_h(
+            k=k,
+            w=w,
+            u=u,
+            g=g,
+            initial_state=initial_state,
+            output_final_state=False,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            use_exp2=use_exp2,
+            transpose_state_layout=transpose_state_layout,
+        )
     dv = chunk_bwd_dv_local(
         q=q,
         k=k,
@@ -248,27 +267,40 @@ class ChunkGatedDeltaRuleFunction(paddle.autograd.PyLayer):
 
         chunk_indices = prepare_chunk_indices(
             cu_seqlens, 64, cu_seqlens_cpu=cu_seqlens_cpu) if cu_seqlens is not None else None
-        g, o, A, final_state, initial_state, g_input = chunk_gated_delta_rule_fwd(
-            q=q,
-            k=k,
-            v=v,
-            g=g,
-            beta=beta,
-            scale=scale,
-            initial_state=initial_state,
+        use_saved_intermediates = _use_saved_intermediates_no_recompute(
             output_final_state=output_final_state,
             cu_seqlens=cu_seqlens,
             cp_context=cp_context,
-            chunk_indices=chunk_indices,
-            transpose_state_layout=transpose_state_layout,
-            use_gate_in_kernel=use_gate_in_kernel,
-            A_log=A_log,
-            dt_bias=dt_bias,
         )
+        with activate_paddle_driver(), compat_kernel_wrapper_fastpath():
+            gdn_outputs = chunk_gated_delta_rule_fwd(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                scale=scale,
+                initial_state=initial_state,
+                output_final_state=output_final_state,
+                cu_seqlens=cu_seqlens,
+                cp_context=cp_context,
+                chunk_indices=chunk_indices,
+                transpose_state_layout=transpose_state_layout,
+                use_gate_in_kernel=use_gate_in_kernel,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                return_intermediates=use_saved_intermediates,
+            )
+        if use_saved_intermediates:
+            g, o, A, final_state, initial_state, g_input, w, u, h, v_new = gdn_outputs
+        else:
+            g, o, A, final_state, initial_state, g_input = gdn_outputs
+            w = u = h = v_new = None
         ctx.save_for_backward(
             q, q_rstd, k, k_rstd, v, g, beta, A,
             initial_state, cu_seqlens, chunk_indices,
             g_input, A_log, dt_bias,
+            w, u, h, v_new,
         )
         # Store non-tensor params as ctx attributes
         ctx.scale = scale
@@ -277,6 +309,7 @@ class ChunkGatedDeltaRuleFunction(paddle.autograd.PyLayer):
         ctx.transpose_state_layout = transpose_state_layout
         ctx.use_gate_in_kernel = use_gate_in_kernel
         ctx.output_final_state = output_final_state
+        ctx.use_saved_intermediates = use_saved_intermediates
         # Paddle PyLayer backward must return exactly as many values as tensor inputs.
         # Record which forward args are tensors so backward can filter its return.
         # Also record which tensor inputs need gradients (stop_gradient=False),
@@ -303,27 +336,33 @@ class ChunkGatedDeltaRuleFunction(paddle.autograd.PyLayer):
             dht = None
         (q, q_rstd, k, k_rstd, v, g, beta, A,
          initial_state, cu_seqlens, chunk_indices,
-         g_input, A_log, dt_bias) = ctx.saved_tensor()
-        dq, dk, dv, db, dg, dh0, dA_log, ddt_bias = chunk_gated_delta_rule_bwd(
-            q=q,
-            k=k,
-            v=v,
-            g=g,
-            beta=beta,
-            A=A,
-            scale=ctx.scale,
-            initial_state=initial_state,
-            do=do,
-            dht=dht,
-            cu_seqlens=cu_seqlens,
-            cp_context=ctx.cp_context,
-            chunk_indices=chunk_indices,
-            transpose_state_layout=ctx.transpose_state_layout,
-            use_gate_in_kernel=ctx.use_gate_in_kernel,
-            g_input=g_input,
-            A_log=A_log,
-            dt_bias=dt_bias,
-        )
+         g_input, A_log, dt_bias,
+         w, u, h, v_new) = ctx.saved_tensor()
+        with activate_paddle_driver(), compat_kernel_wrapper_fastpath():
+            dq, dk, dv, db, dg, dh0, dA_log, ddt_bias = chunk_gated_delta_rule_bwd(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                A=A,
+                scale=ctx.scale,
+                initial_state=initial_state,
+                do=do,
+                dht=dht,
+                cu_seqlens=cu_seqlens,
+                cp_context=ctx.cp_context,
+                chunk_indices=chunk_indices,
+                transpose_state_layout=ctx.transpose_state_layout,
+                use_gate_in_kernel=ctx.use_gate_in_kernel,
+                g_input=g_input,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                saved_w=w if ctx.use_saved_intermediates else None,
+                saved_u=u if ctx.use_saved_intermediates else None,
+                saved_h=h if ctx.use_saved_intermediates else None,
+                saved_v_new=v_new if ctx.use_saved_intermediates else None,
+            )
         if ctx.use_qk_l2norm_in_kernel:
             dq = l2norm_bwd(q, q_rstd, dq)
             dk = l2norm_bwd(k, k_rstd, dk)

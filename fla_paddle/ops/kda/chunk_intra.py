@@ -872,7 +872,7 @@ def chunk_kda_bwd_intra(
     dq2 = paddle.empty_like(q)
     dk2 = paddle.empty_like(k)
     db2 = paddle.empty([NK] + list(beta.shape), dtype=paddle.float32)
-    dg2 = paddle.empty_like(dg).cast(paddle.float32)
+    dg2 = paddle.empty_like(dg, dtype=paddle.float32)
     grid = (NK * NC, NT, B * H)
     chunk_kda_bwd_kernel_intra[grid](
         q=q,

@@ -229,6 +229,12 @@ def _warmup_autotune(fn, n: int | None = None):
     torch.cuda.synchronize()
 
 
+def _clear_gradients(inputs: dict[str, torch.Tensor]):
+    for tensor in inputs.values():
+        if isinstance(tensor, torch.Tensor) and tensor.requires_grad and tensor.is_floating_point():
+            tensor.grad = None
+
+
 def benchmark_op(
     op_name: str,
     shapes: dict[str, dict[str, int]],
@@ -288,6 +294,7 @@ def benchmark_op(
                 result = op_fn(**inputs, **config.extra_kwargs)
                 t = result[0] if config.output_is_tuple else result
                 t.backward(do)
+                _clear_gradients(inputs)
 
             _warmup_autotune(_fwdbwd_fn)
         except Exception as e:
@@ -321,6 +328,7 @@ def benchmark_op(
                     result = op_fn(**inputs, **config.extra_kwargs)
                     t = result[0] if config.output_is_tuple else result
                     t.backward(do)
+                    _clear_gradients(inputs)
 
             try:
                 ms = triton.testing.do_bench(
